@@ -2,7 +2,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import Store, { ACTION, CHANGE } from "./store";
 import { ViewDefinition, DataView, inferViewDefinition, createDataView } from "./data_view";
-import { ColumnType } from "./loader";
+import { columnDec, columnHex, columnString, ColumnType } from "./loader";
 import { Modal, Dropdown } from "react-bootstrap";
 import {
     BsPlus,
@@ -30,11 +30,13 @@ const PALETTE = {
     exp:   "#CA8AFF", // バイオレット
 };
 
+type ViewType = { type: ColumnType | "DERIVED" | "INDEX", code: boolean };
+
 // Columns パレットの1アイテム（実列 / 派生列 / __index__）
 type PaletteItem = {
     name: string;
     kind: "real" | "derived" | "index";
-    type: ColumnType | "DERIVED" | "INDEX";
+    type: ViewType;
 };
 
 // Axis スロット（将来的に増やす前提で配列化）
@@ -137,28 +139,19 @@ const extractVariables = (expr: string): string[] => {
 
 // 色カテゴリとバッジ
 type ColorCat = "index" | "int" | "code" | "exp";
-const colorCategory = (name: string, type: ColumnType | "DERIVED" | "INDEX"): ColorCat => {
+const colorCategory = (name: string, { type, code }: ViewType): ColorCat => {
     if (name === "__index__" || type === "INDEX") return "index";
     if (type === "DERIVED") return "exp";
-    switch (type) {
-        case ColumnType.INTEGER:
-        case ColumnType.HEX:
-            return "int";
-        case ColumnType.STRING_CODE:
-        case ColumnType.INT_CODE:
-        default:
-            return "code";
-    }
+    return type == columnString || code ? "code" : "int";
 }
 
-const typeBadgeText = (t: ColumnType | "DERIVED" | "INDEX") => {
-    if (t === "DERIVED") return "expr";
-    if (t === "INDEX") return "index";
-    switch (t) {
-        case ColumnType.INTEGER: return "int";
-        case ColumnType.HEX: return "hex";
-        case ColumnType.STRING_CODE: return "code";
-        case ColumnType.INT_CODE: return "code";
+const typeBadgeText = ({ type, code }: ViewType) => {
+    if (type === "DERIVED") return "expr";
+    if (type === "INDEX") return "index";
+    if (code) return "code";
+    switch (type) {
+        case columnDec: return "dec";
+        case columnHex: return "hex";
         default: return "col";
     }
 };
@@ -171,13 +164,13 @@ const buildPalette = (store: Store, current: ViewDefinition | null, search: stri
 
     // 実列：RAW_STRING は除外（数値化不可）
     const real: PaletteItem[] = headers
-        .filter(h => typesMap[h] !== ColumnType.RAW_STRING)
-        .map(h => ({ name: h, kind: "real", type: typesMap[h] }));
+        .map(h => ({ name: h, kind: "real", type: { type: typesMap[h], code: store.loader.columnFromName(h).codeToValueList != null } }) as PaletteItem)
+        .filter(({ type }) => type.type !== columnString || type.code);
 
     // __index__ と派生列（現在の定義から）
-    const indexItem: PaletteItem = { name: "__index__", kind: "index", type: "INDEX" };
+    const indexItem: PaletteItem = { name: "__index__", kind: "index", type: { type: "INDEX", code: false } };
     const derivedList = Object.entries(current?.columns ?? {}).map(([name]) => name).sort();
-    const derived: PaletteItem[] = derivedList.map(n => ({ name: n, kind: "derived", type: "DERIVED" }));
+    const derived: PaletteItem[] = derivedList.map(n => ({ name: n, kind: "derived", type: { type: "DERIVED", code: false } }));
 
     // 表示順：index → 実列（int/code） → 派生（exp）／名前昇順
     const numericReals = real.sort((a, b) => a.name.localeCompare(b.name));
@@ -196,7 +189,7 @@ const buildPalette = (store: Store, current: ViewDefinition | null, search: stri
 //  * derived は exp バッジを非表示（見切れ対策）
 const ColumnChip: React.FC<{
     name: string;
-    type: ColumnType | "DERIVED" | "INDEX";
+    type: ViewType;
     draggable?: boolean;
     onDragStart?: (e: React.DragEvent) => void;
     // Columns 側：編集・削除
@@ -207,7 +200,7 @@ const ColumnChip: React.FC<{
 }> = ({ name, type, draggable, onDragStart, onEdit, onDelete, onClear }) => {
     const cat = colorCategory(name, type);
     const accent = PALETTE[cat];
-    const showBadge = type !== "DERIVED"; // 派生列は exp バッジを出さない
+    const showBadge = type.type !== "DERIVED"; // 派生列は exp バッジを出さない
 
     return (
         <div
@@ -243,7 +236,7 @@ const ColumnChip: React.FC<{
 const AxisCard: React.FC<{
     label: string;
     assignedName: string | null;
-    assignedType: ColumnType | "DERIVED" | "INDEX" | null;
+    assignedType: ViewType | null;
     acceptNumeric: boolean;
     onDropName: (name: string, colType: ColumnType | "DERIVED" | "INDEX") => void;
     onClear: () => void;
@@ -266,7 +259,7 @@ const AxisCard: React.FC<{
             const raw = e.dataTransfer.getData("application/json") || e.dataTransfer.getData("text/plain");
             const data = JSON.parse(raw) as { name: string; type: ColumnType | "DERIVED" | "INDEX" };
             // 数値のみ受け入れ（RAW_STRING は Columns に出ないが念のためチェック）
-            const isNumeric = data.type === "DERIVED" || data.type === "INDEX" || data.type !== ColumnType.RAW_STRING;
+            const isNumeric = data.type === "DERIVED" || data.type === "INDEX" || data.type !== columnString;
             if (acceptNumeric && !isNumeric) {
                 setShine();
                 onReject("Type mismatch: this axis expects a numeric column.");
@@ -304,7 +297,7 @@ const AxisCard: React.FC<{
                 <div style={{ width: CHIP_WIDTH }}>
                     <ColumnChip
                         name={assignedName}
-                        type={assignedType ?? "INDEX"}
+                        type={assignedType ?? { type: "INDEX", code: false }}
                         draggable={false}
                         onClear={onClear}
                     />
@@ -785,13 +778,14 @@ function resolveTypeOfName(
     store: Store,
     current: ViewDefinition | null,
     name: string | null
-): ColumnType | "DERIVED" | "INDEX" | null {
+): ViewType | null {
     if (!name) return null;
-    if (name === "__index__") return "INDEX";
+    if (name === "__index__") return { type: "INDEX", code: false };
+    if ((current?.columns ?? {})[name]) return { type: "DERIVED", code: false };
     const headers: string[] = store.loader?.headers ?? [];
     const typesMap: { [name: string]: ColumnType } = store.loader?.types ?? {};
-    if (headers.includes(name)) return typesMap[name] ?? ColumnType.INTEGER; // 既定は数値扱い
-    if ((current?.columns ?? {})[name]) return "DERIVED";
+    const code = store.loader.columnFromName(name).codeToValueList != null;
+    if (headers.includes(name)) return { type: typesMap[name] ?? columnDec, code }; // 既定は数値扱い
     return null;
 }
 

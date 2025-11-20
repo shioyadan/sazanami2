@@ -210,7 +210,7 @@ class CanvasRenderer {
 
         // 描画まびき
         // X 方向の密度に応じても間引き量をかえる
-        const avgNumPointX = (dataView.getEndIdx(Infinity,Infinity) - dataView.getStartIdx(-Infinity, -Infinity)) / (dataView.getMaxY() - dataView.getMinY());
+        const avgNumPointX = (dataView.getEndIdx(Infinity,Infinity) - dataView.getStartIdx(-Infinity, -Infinity) + 1) / (dataView.getMaxY() - dataView.getMinY() + 1);
         let step = Math.max(1, Math.floor(ratioY * avgNumPointX / 4 / 32));
 
         if (endIdx - startIdx < 100000) step = 1; // 少ない場合は間引かない
@@ -288,7 +288,7 @@ class CanvasRenderer {
             canvasCtx.moveTo(this.MARGIN_LEFT_, y);
             canvasCtx.lineTo(width, y);
             canvasCtx.stroke();
-            canvasCtx.fillText(val.toString(), this.MARGIN_LEFT_ - 5, y);
+            canvasCtx.fillText(dataView.yToString(val), this.MARGIN_LEFT_ - 5, y);
         }
 
         // X-axis ticks
@@ -305,7 +305,7 @@ class CanvasRenderer {
             const val = i;
             const x = val * scaleXVal - tickOffsetX;
             if (x > plotWidth) break;
-            canvasCtx.fillText(val.toString(), x, plotHeight + 3);
+            canvasCtx.fillText(dataView.xToString(val), x, plotHeight + 3);
         }
 
         // let elapsedTime = (new Date()).getTime() - startTime;

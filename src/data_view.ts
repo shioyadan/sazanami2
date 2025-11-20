@@ -1,5 +1,5 @@
 // data_view.ts
-import { Loader, ColumnBuffer, ColumnType, ColumnInterface  } from "./loader";
+import { Loader, ColumnBuffer, columnDec, ColumnType, ColumnInterface  } from "./loader";
 import { buildPaletteByName, inferColorMapName } from "./color_map";
 
 // 軸と色の仕様
@@ -70,9 +70,15 @@ class IndexColumn implements ColumnInterface {
     getString(i: number): string {
         return this.getNumber(i).toString();
     }
-    get codeToStringList(): string[] { return [];}
-    get codeToIntList(): number[] { return []; }
+    get codeToValueList() { return null; }
 
+}
+
+class EmptyColumn implements ColumnInterface {
+    stat = { min: 0, max: 0, deviationFromMax: 0 };
+    getNumber(_: number) { return 0; }
+    getString(i: number) { return this.getNumber(i).toString(); }
+    codeToValueList = null;
 }
 
 // 仮想列で使用する式エンジン
@@ -229,8 +235,7 @@ class ExpressionColumn implements ColumnInterface {
         return this.getNumber(i).toString();
     }
 
-    get codeToStringList(): string[] { return [];}
-    get codeToIntList(): number[] { return []; }
+    get codeToValueList() { return null; }
 }
 
 // 仮想カラムレジストリ
@@ -297,6 +302,8 @@ export class DataView {
     private def_!: ViewDefinition;
     private numRows_ = 0;
     private xCol_!: ColumnInterface;
+    private xType_!: ColumnType;
+    private yType_!: ColumnType;
     private yCol_!: ColumnInterface;
     private colorCol_: ColumnInterface | null = null;
     private loaderRef_!: Loader;
@@ -354,7 +361,7 @@ export class DataView {
             if (vcol) return vcol;
             let col = loader.columnFromName(name);
             if (!col) {
-                col = new IndexColumn(this.numRows_); // フォールバックとして行インデクス列
+                col = new EmptyColumn();
             }
             return col;
         };
@@ -379,10 +386,12 @@ export class DataView {
         // types 構築：実列 + 仮想列 + __index__
         this.types_ = { ...loader.types };
         for (const vName of this.registry_.list()) {
-            this.types_[vName] = ColumnType.INTEGER; // 仮想列は数式で得られる数値列として扱う
+            this.types_[vName] = columnDec; // 仮想列は数式で得られる数値列として扱う
         }
-        this.types_["__index__"] = ColumnType.INTEGER; // 便宜上、仮想インデックス列も整数として公開
+        this.types_["__index__"] = columnDec; // 便宜上、仮想インデックス列も整数として公開
 
+        this.xType_ = this.types_[spec.axisXField] ?? columnDec;
+        this.yType_ = this.types_[spec.axisYField] ?? columnDec;
 
         this.initialized_ = true; // 以降は読み取り専用
     }
@@ -394,6 +403,9 @@ export class DataView {
 
     getX(i: number): number { return this.xCol_.getNumber(i); }
     getY(i: number): number { return this.yCol_.getNumber(i); }
+
+    xToString(val: number) { return this.xType_.toString(val); }
+    yToString(val: number) { return this.yType_.toString(val); }
 
     // カラーインデックスの取得
     // colorField の値をパレットサイズより小さい整数に丸める
