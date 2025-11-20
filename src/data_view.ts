@@ -467,6 +467,7 @@ export class DataView {
     }
 
     getMaxX(): number { return this.xCol_.stat.max; }
+    getMinX(): number { return this.xCol_.stat.min; }
     getMaxY(): number { return this.yCol_.stat.max; }
     getMinY(): number { return this.yCol_.stat.min; }
 

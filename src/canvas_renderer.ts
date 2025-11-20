@@ -276,9 +276,11 @@ class CanvasRenderer {
         const rawDataSpacingY = pixelMinSpacingY / scaleYVal;
         let tickSpacingY = this.niceNum_(rawDataSpacingY);
         tickSpacingY = tickSpacingY < 1 ? 1 : tickSpacingY; // 最小値を 1 に設定
-        for (let val = 0; val <= dataView.getMaxY(); val += tickSpacingY) {
+
+        for (let val = Math.ceil(Math.max(offsetY / scaleYVal, dataView.getMinY()) / tickSpacingY) * tickSpacingY;
+             val <= dataView.getMaxY();
+             val += tickSpacingY) {
             const y = val * scaleYVal - offsetY;
-            if (y < 0) continue;
             if (y > plotHeight) break;
             canvasCtx.strokeStyle = '#444';
             canvasCtx.lineWidth = 1;
@@ -296,10 +298,12 @@ class CanvasRenderer {
         const rawDataSpacingX = pixelMinSpacingX / scaleXVal;
         let tickSpacingX = this.niceNum_(rawDataSpacingX);
         tickSpacingX = tickSpacingX < 1 ? 1 : tickSpacingX; // 最小値を 1 に設定
-        for (let i = 0; i < dataView.getMaxX(); i += tickSpacingX) {
+        const tickOffsetX = offsetX - this.MARGIN_LEFT_ - (scaleXVal / 2);
+        for (let i = Math.ceil(Math.max(tickOffsetX / scaleXVal, dataView.getMinX()) / tickSpacingX) * tickSpacingX;
+             i < dataView.getMaxX();
+             i += tickSpacingX) {
             const val = i;
-            const x = this.MARGIN_LEFT_ + val * scaleXVal + (scaleXVal / 2) - offsetX;
-            if (x < 0) continue;
+            const x = val * scaleXVal - tickOffsetX;
             if (x > plotWidth) break;
             canvasCtx.fillText(val.toString(), x, plotHeight + 3);
         }
@@ -361,7 +365,7 @@ class CanvasRenderer {
     }
 
     /**
-     * データ全体（X: 0..maxX-1, Y: minY..maxY）がプロット領域に収まるように
+     * データ全体（X: minX..maxX, Y: minY..maxY）がプロット領域に収まるように
      * scaleXLog / scaleYLog を設定し、オフセットもリセットする。
      */
     fitScaleToData(dataView: DataView | null, renderCtx: RendererContext, paddingRatio = 1.0): RendererContext {
@@ -371,12 +375,13 @@ class CanvasRenderer {
         const plotWidth  = Math.max(1, width  - this.MARGIN_LEFT_);
         const plotHeight = Math.max(1, height - this.MARGIN_BOTTOM_);
 
-        const maxX = Math.max(0, dataView.getMaxX());
-        const maxY = Math.max(0, dataView.getMaxY());
-        const minY = Math.max(0, dataView.getMinY ? dataView.getMinY() : 0);
+        const maxX = dataView.getMaxX();
+        const minX = dataView.getMinX();
+        const maxY = dataView.getMaxY();
+        const minY = dataView.getMinY ? dataView.getMinY() : 0;
 
-        // X方向は 0..maxX-1 のセル幅
-        const dataPixelWidth  = Math.max(1, maxX) * paddingRatio;
+        // X方向は minX..maxX のセル幅
+        const dataPixelWidth  = Math.max(1, maxX - minX + 1) * paddingRatio;
 
         // Y方向は minY..maxY の範囲を収める
         const baseScaleY = 1;
@@ -402,15 +407,12 @@ class CanvasRenderer {
         const nextOffsetY = minY * baseScaleY * Math.exp(nextScaleYLog);
 
         // 横方向オフセット
-        let nextOffsetX: number;
+        let nextOffsetX = minX * Math.exp(nextScaleXLog);
         if (clamped) {
             // 実際のデータ幅（px換算後）
             const usedWidth = dataPixelWidth * Math.exp(nextScaleXLog);
             // プロット領域中央に配置
-            nextOffsetX = -(plotWidth - usedWidth) / 2;
-        } else {
-            // フィットの場合は左寄せ
-            nextOffsetX = 0;
+            nextOffsetX -= (plotWidth - usedWidth) / 2;
         }
 
         return {
