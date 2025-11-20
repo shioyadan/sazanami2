@@ -325,13 +325,20 @@ const MainCanvas: React.FC<{ store: Store }> = ({ store }) => {
             const mouseX = e.clientX - rect.left;
             const mouseY = e.clientY - rect.top;
 
+            // 一回の操作で進むズーム量は常に「1ステップ」固定
+            // 所要時間は常に ZOOM_DURATION_MS で一定
+            const zoomIn = e.deltaY < 0;
+
             if (e.ctrlKey) {
                 // 一様ズーム
-                // 一回の操作で進むズーム量は常に「1ステップ」固定
-                // 所要時間は常に ZOOM_DURATION_MS で一定
-                const zoomIn = e.deltaX < 0 || e.deltaY < 0;
                 animateZoomByTime(ZOOM_DURATION_MS, ZOOM_DIVISIONS_WHEEL, (divs) => {
                     const next = renderer.zoomUniform(store.state.renderCtx, mouseX, mouseY, zoomIn, divs);
+                    store.trigger(ACTION.UPDATE_RENDERER_CONTEXT, next);
+                });
+            } else if (e.shiftKey) {
+                // 水平ズーム
+                animateZoomByTime(ZOOM_DURATION_MS, ZOOM_DIVISIONS_WHEEL, (divs) => {
+                    const next = renderer.zoomHorizontal(store.state.renderCtx, mouseX, mouseY, zoomIn, divs);
                     store.trigger(ACTION.UPDATE_RENDERER_CONTEXT, next);
                 });
             } else {

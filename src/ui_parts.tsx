@@ -220,6 +220,7 @@ const HelpDialog = (props: { store: Store }) => {
                         <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
                             <li style={liStyle}><kbd style={kbdStyle}>Drag with left button</kbd><span>Pan.</span></li>
                             <li style={liStyle}><kbd style={kbdStyle}>Drag with right button</kbd><span>Pinch.</span></li>
+                            <li style={liStyle}><kbd style={kbdStyle}>Shift + mouse wheel</kbd><span>Zoom horizontal only.</span></li>
                             <li style={liStyle}><kbd style={kbdStyle}>Ctrl/⌘ + mouse wheel</kbd><span>Zoom in/out.</span></li>
                             <li style={liStyle}><kbd style={kbdStyle}>Ctrl/⌘ + up/down</kbd><span>Zoom vertical only.</span></li>
                             <li style={liStyle}><kbd style={kbdStyle}>Ctrl/⌘ + left/right</kbd><span>Zoom horizontal only.</span></li>
