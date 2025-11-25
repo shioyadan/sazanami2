@@ -9,7 +9,21 @@ export const columnDec = {
 
 export const columnHex = {
     toString(value: number | string) {
-        return `0x${value.toString(16)}`;
+        const raw = typeof value === "number" ? value.toString(16) : value.toString();
+        const hasMinus = raw.startsWith("-");
+        let hex = hasMinus ? raw.slice(1) : raw;
+        if (hex.startsWith("0x") || hex.startsWith("0X")) {
+            hex = hex.slice(2);
+        }
+        hex = hex.replace(/_/g, "").toLowerCase();
+        // insert "_" every 4 chars from the right
+        let grouped = "";
+        for (let i = hex.length; i > 0; i -= 4) {
+            const start = Math.max(0, i - 4);
+            const chunk = hex.slice(start, i);
+            grouped = grouped ? `${chunk}_${grouped}` : chunk;
+        }
+        return `${hasMinus ? "-" : ""}0x${grouped}`;
     }
 }
 
