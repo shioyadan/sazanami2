@@ -275,22 +275,25 @@ class Loader {
 
     private finalizeTypes_(): void {
         this.headers_.forEach((header, index) => {
-            // 文字列の出現パターン数をカウントし，一定割合を超えていたら raw string に
-            let code = true;
-            if (Object.keys(this.rawStringMap_[header]).length > Loader.TYPE_DETECT_COUNT_ / 3) {
-                code = false;
+            let isCode = false;
+
+            // 文字列の出現パターン数をカウントし，一定割合以内なら code に
+            if (Object.keys(this.rawStringMap_[header]).length < Loader.TYPE_DETECT_COUNT_ / 3) {
+                isCode = true;
             }
 
             let isOrgHex = this.detection_[header] === columnHex;
-            if (this.detection_[header] === columnDec || this.detection_[header] === columnHex) {
-                // 整数列の場合，出現パターン数が少なければ INT_CODE に変更
-                const uniqueCount = new Set(this.rawBuffer_[header]).size;
-                code = uniqueCount < 32;
-            }
+            
+            // 整数のコード化はあまりうまくいかないので，現在は無効
+            // if (this.detection_[header] === columnDec || this.detection_[header] === columnHex) {
+            //     // 整数列の場合，出現パターン数が少なければ INT_CODE に変更
+            //     const uniqueCount = new Set(this.rawBuffer_[header]).size;
+            //     isCode = uniqueCount < 32;
+            // }
             const type = this.detection_[header];
             this.columnsArr_[index].type = type;
 
-            if (code) {
+            if (isCode) {
                 this.columnsArr_[index].codeToValueList = [];
             }
 
