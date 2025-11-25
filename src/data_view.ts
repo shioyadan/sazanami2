@@ -446,6 +446,11 @@ export class DataView {
     }
 
     getStartIdx(xStart: number, yStart: number): number {
+        // 十分に小さいときは全体を走査
+        if (this.numRows_ < 10000000) {
+            return 0;
+        }
+
         let xIndexStart = this.lowerBound_(this.xCol_, xStart);
         let yIndexStart = this.lowerBound_(this.yCol_, yStart);
 
@@ -463,6 +468,11 @@ export class DataView {
     }
 
     getEndIdx(xEnd: number, yEnd: number): number {
+        // 十分に小さいときは全体を走査
+        if (this.numRows_ < 10000000) {
+            return this.numRows_;
+        }
+
         let xIndexEnd = Math.min(this.lowerBound_(this.xCol_, xEnd), this.numRows_);
         let yIndexEnd = Math.min(this.lowerBound_(this.yCol_, yEnd), this.numRows_);
 
