@@ -281,7 +281,7 @@ class Loader {
             this.detection_[header] = columnHex;
         }
         // 数値じゃ無いものが1度でも現れたら STRING に変更
-        if (this.detection_[header] !== columnString && !isHex && !isDec) {
+        if (this.detection_[header] !== columnString && !isHex && Number.isNaN(Number(value))) {
             this.detection_[header] = columnString;
         }
         // 文字列の出現パターン数をカウントし，finalizeTypes_ で判定
@@ -354,7 +354,7 @@ class Loader {
     /** Int32Array bufferに数値を追加 (整数・16進 or 10進) */
     private pushBufferValue_(index: number, raw: string): void {
         const col = this.columnsArr_[index];
-        let num = col.type === columnHex ? parseInt(raw, 16) : parseInt(raw, 10);
+        let num = col.type === columnHex ? parseInt(raw, 16) : Math.round(Number(raw));
         // Int32 範囲を超えた場合は元の文字列が表す値の下位 32bit を使用
         if (num < Loader.INT32_MIN_ || num > Loader.INT32_MAX_) {
             // BigInt を使って元の値の下位 32bit を取得
@@ -362,10 +362,16 @@ class Loader {
             const bigRaw = col.type === columnHex
                 ? (raw.startsWith("0x") || raw.startsWith("0X") ? raw : `0x${raw}`)
                 : raw;
+            let big;
+            try {
+                big = BigInt(bigRaw);
+            } catch (error) {
+                big = BigInt(num);
+            }
             const masked = 
                 num > Loader.INT32_MAX_ ? 
-                BigInt.asUintN(31, BigInt(bigRaw)) :   
-                BigInt.asIntN(32, BigInt(bigRaw));
+                BigInt.asUintN(31, big) :
+                BigInt.asIntN(32, big);
             num = Number(masked);
         }
         if (col.length >= col.buffer.length) {
