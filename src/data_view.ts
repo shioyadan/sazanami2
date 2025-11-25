@@ -446,46 +446,43 @@ export class DataView {
     }
 
     getStartIdx(xStart: number, yStart: number): number {
-        // 十分に小さいときは全体を走査
-        if (this.numRows_ < 10000000) {
-            return 0;
+        const xDeviationZero = this.xCol_.stat.deviationFromMax === 0;
+        const yDeviationZero = this.yCol_.stat.deviationFromMax === 0;
+
+        const xIndexStart = this.lowerBound_(this.xCol_, xStart);
+        const yIndexStart = this.lowerBound_(this.yCol_, yStart);
+
+        if (xDeviationZero && yDeviationZero) {
+            return Math.min(xIndexStart, yIndexStart);
+        }
+        if (xDeviationZero) {
+            return xIndexStart;
+        }
+        if (yDeviationZero) {
+            return yIndexStart;
         }
 
-        let xIndexStart = this.lowerBound_(this.xCol_, xStart);
-        let yIndexStart = this.lowerBound_(this.yCol_, yStart);
-
-        // 最大偏差率が小さい方を選ぶ
-        let xDeviationFromMax_ = this.xCol_.stat.deviationFromMax / (this.xCol_.stat.max - this.xCol_.stat.min);
-        let yDeviationFromMax_ = this.yCol_.stat.deviationFromMax / (this.yCol_.stat.max - this.yCol_.stat.min);
-
-        // 最大偏差分を引く
-        xIndexStart -= this.xCol_.stat.deviationFromMax;
-        yIndexStart -= this.yCol_.stat.deviationFromMax;
-
-        if (xDeviationFromMax_ == yDeviationFromMax_ ) 
-            return Math.min(xIndexStart, yIndexStart); // 偏差が同じなら小さい方
-        return xDeviationFromMax_ > yDeviationFromMax_ ? yIndexStart : xIndexStart;
+        return 0; // 両方に偏差がある場合は全体を走査
     }
 
     getEndIdx(xEnd: number, yEnd: number): number {
-        // 十分に小さいときは全体を走査
-        if (this.numRows_ < 10000000) {
-            return this.numRows_;
+        const xDeviationZero = this.xCol_.stat.deviationFromMax === 0;
+        const yDeviationZero = this.yCol_.stat.deviationFromMax === 0;
+
+        const xIndexEnd = Math.min(this.lowerBound_(this.xCol_, xEnd), this.numRows_);
+        const yIndexEnd = Math.min(this.lowerBound_(this.yCol_, yEnd), this.numRows_);
+        
+        if (xDeviationZero && yDeviationZero) {
+            return Math.max(xIndexEnd, yIndexEnd);
+        }
+        if (xDeviationZero) {
+            return xIndexEnd;
+        }
+        if (yDeviationZero) {
+            return yIndexEnd;
         }
 
-        let xIndexEnd = Math.min(this.lowerBound_(this.xCol_, xEnd), this.numRows_);
-        let yIndexEnd = Math.min(this.lowerBound_(this.yCol_, yEnd), this.numRows_);
-
-        // 最大偏差分を足す
-        xIndexEnd += this.xCol_.stat.deviationFromMax;
-        yIndexEnd += this.yCol_.stat.deviationFromMax;
-
-        // 最大偏差率が小さい方を選ぶ
-        let xDeviationFromMax_ = this.xCol_.stat.deviationFromMax / (this.xCol_.stat.max - this.xCol_.stat.min);
-        let yDeviationFromMax_ = this.yCol_.stat.deviationFromMax / (this.yCol_.stat.max - this.yCol_.stat.min);
-        if (xDeviationFromMax_ == yDeviationFromMax_ ) 
-            return Math.max(xIndexEnd, yIndexEnd); // 偏差が同じなら大きい方
-        return xDeviationFromMax_ > yDeviationFromMax_ ? yIndexEnd : xIndexEnd;
+        return this.numRows_; // 両方に偏差がある場合は全体を走査
     }
 
     getMaxX(): number { return this.xCol_.stat.max; }
