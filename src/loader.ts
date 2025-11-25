@@ -278,7 +278,9 @@ class Loader {
             let isCode = false;
 
             // 文字列の出現パターン数をカウントし，一定割合以内なら code に
-            if (Object.keys(this.rawStringMap_[header]).length < Loader.TYPE_DETECT_COUNT_ / 3) {
+            if (this.detection_[header] === columnString &&
+                Object.keys(this.rawStringMap_[header]).length < Loader.TYPE_DETECT_COUNT_ / 3
+            ) {
                 isCode = true;
             }
 
