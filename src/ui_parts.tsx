@@ -426,8 +426,8 @@ const LogOverlay: React.FC<Props> = ({ store, width = 420, height = 120 }) => {
                     paddingRight: 48 // 右上アイコン分の余白
                 }}
             >
-                {logs.map(l => (
-                    <div>{l}</div>
+                {logs.map((l, index) => (
+                    <div key={index}>{l}</div>
                 ))}
             </div>
         </div>
