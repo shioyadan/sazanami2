@@ -1,9 +1,20 @@
 import { FileLineReader, FileLineReaderOptions } from "./file_line_reader";
 import { inferViewDefinition, ViewDefinition, DataView, isEqualViewDefinition, createDataView } from "./data_view";
 
+function group(ungrouped: string, interval: number) {
+    // insert "_" for each interval from the right
+    let grouped = "";
+    for (let i = ungrouped.length; i > 0; i -= interval) {
+        const start = Math.max(0, i - interval);
+        const chunk = ungrouped.slice(start, i);
+        grouped = grouped ? `${chunk}_${grouped}` : chunk;
+    }
+    return grouped;
+}
+
 export const columnDec = {
     toString(value: number | string) {
-        return value.toString();
+        return group(value.toString(), 3);
     }
 };
 
@@ -16,14 +27,7 @@ export const columnHex = {
             hex = hex.slice(2);
         }
         hex = hex.replace(/_/g, "").toLowerCase();
-        // insert "_" every 4 chars from the right
-        let grouped = "";
-        for (let i = hex.length; i > 0; i -= 4) {
-            const start = Math.max(0, i - 4);
-            const chunk = hex.slice(start, i);
-            grouped = grouped ? `${chunk}_${grouped}` : chunk;
-        }
-        return `${hasMinus ? "-" : ""}0x${grouped}`;
+        return `${hasMinus ? "-" : ""}0x${group(hex, 4)}`;
     }
 }
 
