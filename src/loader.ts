@@ -1,4 +1,4 @@
-import { FileLineReader, FileLineReaderOptions } from "./file_line_reader";
+import { FileRecordReader, FileRecordReaderOptions } from "./file_record_reader";
 import { inferViewDefinition, ViewDefinition, DataView, isEqualViewDefinition, createDataView } from "./data_view";
 
 function group(ungrouped: string, interval: number) {
@@ -103,8 +103,24 @@ class ColumnBuffer implements ColumnInterface {
 }
 
 
+function tokenize(line: { escaped: boolean, value: string }[], separator: string) {
+    const values = [''];
+
+    for (const { escaped, value } of line) {
+        if (escaped) {
+            values[values.length - 1] += value;
+        } else {
+            const [head, ...rest] = value.split(separator);
+            values[values.length - 1] += head;
+            values.push(...rest);
+        }
+    }
+
+    return values;
+}
+
 class Loader {
-    private lineNum: number = 1;
+    private recordNum: number = 1;
     private numRows_: number = 0;
     private numWarning: number = 0;
 
@@ -133,7 +149,7 @@ class Loader {
     private static readonly INT32_MIN_ = -2147483648;
     private static readonly INT32_MAX_ = 2147483647;
     private startTime_: number = 0;
-    private reader_: FileLineReader | null = null;
+    private reader_: FileRecordReader | null = null;
 
     private onFormatDetected_: null | (() => void) = null;
     private warningCallback_: null | ((msg: string) => void) = null;
@@ -145,7 +161,7 @@ class Loader {
     }
 
     reset() {
-        this.lineNum = 1;
+        this.recordNum = 1;
         this.numRows_ = 0;
         this.numWarning = 0;
         this.headers_ = [];
@@ -166,12 +182,10 @@ class Loader {
         this.onFormatDetected_ = null;
     }
 
-    load(
-        reader: FileLineReader,
-        finishCallback: (lines: number, elapsedMs: number) => void,
+    async load(
+        reader: FileRecordReader,
         formatDetected: () => void,
-        progressCallback: (progress: number, lineNum: number) => void,
-        errorCallback: (error: any, lineNum: number) => void,
+        progressCallback: (progress: number, recordNum: number) => void,
         warningCallback: (msg: string) => void
     ) {
         this.reset();
@@ -180,35 +194,29 @@ class Loader {
         this.reader_ = reader;
         this.startTime_ = (new Date()).getTime();
 
-        reader.load(
-            (line: string) => { // onLineRead
-                this.parseLine_(line);
-                if (this.lineNum % Loader.REPORT_INTERVAL_ === 0) {
-                    this.dataViewInvalidated_ = true;   // max を更新した可能性があるので invalidate
-                    progressCallback(reader.getProgress(), this.lineNum);
-                }
-                this.lineNum++;
-            },
-            () => { // onFinish
-                if (!this.detectionDone_) {
-                    this.finalizeTypes_();
-                }
+        for await (const record of reader.load()) {
+            this.parseRecord_(record);
+            if (this.recordNum % Loader.REPORT_INTERVAL_ === 0) {
                 this.dataViewInvalidated_ = true;   // max を更新した可能性があるので invalidate
-                let elapsed = ((new Date()).getTime() - this.startTime_);
-                finishCallback(this.lineNum - 1, elapsed);
-            },
-            (error: any) => {   // onError
-                errorCallback(error, this.lineNum);
+                progressCallback(reader.getProgress(), this.recordNum);
             }
-        );
+            this.recordNum++;
+        }
+
+        if (!this.detectionDone_) {
+            this.finalizeTypes_();
+        }
+        this.dataViewInvalidated_ = true;   // max を更新した可能性があるので invalidate
+        let elapsed = ((new Date()).getTime() - this.startTime_);
+
+        return [this.recordNum - 1, elapsed];
     }
 
     // ヘッダー行設定
-    private parseHeader_(line: string): void {
+    private parseHeader_(record: { escaped: boolean, value: string }[]): void {
         // tab かカンマで区切られたヘッダーを想定
-        line = line.trim();
-        let commaValues = line.split(",");
-        let tabValues = line.split("\t");
+        const commaValues = tokenize(record, ",");
+        const tabValues = tokenize(record, "\t");
         this.separatorIsTab_ = (tabValues.length >= commaValues.length);
 
         let values = this.separatorIsTab_ ? tabValues : commaValues;
@@ -224,22 +232,28 @@ class Loader {
         });
     }
 
-    private parseLine_(
-        line: string
+    private parseRecord_(
+        record: { escaped: boolean, value: string }[]
     ): void {
-        line = line.trim();
+        if (!record.length) {
+            return;
+        }
 
-        if (this.lineNum === 1) {
-            this.parseHeader_(line);
+        if (!record[record.length - 1].escaped) {
+            record[record.length - 1].value = record[record.length - 1].value.trim();
+        }
+
+        if (this.recordNum === 1) {
+            this.parseHeader_(record);
         } else {
-            let values = this.separatorIsTab_ ? line.split("\t") : line.split(",");
+            let values = tokenize(record, this.separatorIsTab_ ? "\t" : ",");
 
             // カラムに過不足がある場合
             if (values.length > this.headers_.length) {
                 this.numWarning++;
                 if (this.numWarning <= 10) {
                     this.warningCallback_?.(
-                        `Warning: Line:${this.lineNum} Expected ${this.headers_.length} columns, but got ${values.length}`
+                        `Warning: Record:${this.recordNum} Expected ${this.headers_.length} columns, but got ${values.length}`
                     );
                 }
                 values = values.slice(0, this.headers_.length);

@@ -1,6 +1,6 @@
 import getFZSTD_Reader from "./zstd_reader"
 
-export interface FileLineReaderOptions {
+export interface FileRecordReaderOptions {
     file?: File;
     stream?: ReadableStream<Uint8Array>;
     fileName?: string;
@@ -8,22 +8,20 @@ export interface FileLineReaderOptions {
     url?: string; 
 }
 
-export class FileLineReader {
+export class FileRecordReader {
     private reader_!: ReadableStreamDefaultReader<Uint8Array>;
     private decoder_ = new TextDecoder('utf-8');
-    private buffer_ = '';
     private bytesRead_ = 0; // 読み取ったバイト数
-    private numLine_ = 0;
     private initialized_ = false;
     private isZstd_ = false;
-    private canceled_ = false;
+    private abortController_ = new AbortController();
     
     private url_?: string; // URL を保持
     private stream_: ReadableStream<Uint8Array>;
     private fileName_: string;
     private fileSize_: number;
 
-    constructor(options: FileLineReaderOptions) {
+    constructor(options: FileRecordReaderOptions) {
         if (options.file) {
             const file = options.file;
             this.stream_ = file.stream() || new Response(file).body as ReadableStream<Uint8Array>;
@@ -78,81 +76,98 @@ export class FileLineReader {
         }
     }
 
+    async *load() {
+        let lookahead = false;
+        let fragment = { escaped: false, value: '' };
+        let record: typeof fragment[] = [];
+        let numReads = 0;
 
-    /** 次の行を読み込む。トレイリング改行なし。EOF で null。 */
-    private async readLine_(): Promise<string | null> {
-
-        this.numLine_++;
-        if (this.numLine_ % 50000 === 0) {
-            // UI の更新を待つために一瞬スリープをいれる
-            await new Promise(r => setTimeout(r, 0)); 
-            if (this.canceled_) return null;
+        function push(escaped: boolean) {
+            if (fragment.value) {
+                record.push(fragment);
+                fragment = { escaped, value: '' };
+            }
         }
 
-        // まず内部バッファを確認
-        let newlineIndex = this.buffer_.indexOf('\n');
-        if (newlineIndex !== -1) {
-            const line = this.buffer_.slice(0, newlineIndex);
-            this.buffer_ = this.buffer_.slice(newlineIndex + 1);
-            return line;
-        }
+        await this.init_();
 
-        // 追加読み込み（必要になった分だけ pull で進む）
         while (true) {
+            numReads++;
+            if (numReads % 50000 === 0) {
+                // UI の更新を待つために一瞬スリープをいれる
+                await new Promise(r => setTimeout(r, 0)); 
+                this.abortController_.signal.throwIfAborted();
+            }
+
             const { done, value } = await this.reader_.read();
             if (done) {
-                // 終端で進捗を 100%
-                this.bytesRead_ = this.fileSize_;
-                if (this.buffer_.length > 0) {
-                    const line = this.buffer_;
-                    this.buffer_ = '';
-                    return line;
-                }
-                return null;
+                break;
             }
 
-            if (value) {
-                this.buffer_ += this.decoder_.decode(value, { stream: true });
-                // 非 zstd のときだけ、生バイトをここで進捗加算
-                if (!this.isZstd_) {
-                    this.bytesRead_ += value.byteLength;
-                }
+            // 非 zstd のときだけ、生バイトをここで進捗加算
+            if (!this.isZstd_) {
+                this.bytesRead_ += value.byteLength;
             }
 
-            newlineIndex = this.buffer_.indexOf('\n');
-            if (newlineIndex !== -1) {
-                const line = this.buffer_.slice(0, newlineIndex);
-                this.buffer_ = this.buffer_.slice(newlineIndex + 1);
-                return line;
+            let input = this.decoder_.decode(value, { stream: true });
+
+            parse: while (true) {
+                if (lookahead) {
+                    switch (input[0]) {
+                        case '"':
+                            fragment.value += '"';
+                            input = input.slice(1);
+                            break;
+
+                        case undefined:
+                            break parse;
+
+                        default:
+                            push(false);
+                    }
+
+                    lookahead = false;
+                }
+
+                const index = input.search(fragment.escaped ? /"/ : /["|\n]/);
+                if (index < 0) {
+                    fragment.value += input;
+                    input = '';
+                    break;
+                }
+
+                const delimiter = input[index];
+                fragment.value += input.slice(0, index);
+                input = input.slice(index + 1);
+
+                if (fragment.escaped) {
+                    lookahead = true;
+                } else if (delimiter == '"') {
+                    push(true);
+                } else {
+                    push(false);
+                    yield record;
+                    record = [];
+                }
             }
         }
-    }
 
-    /** コールバックを受け取り、1行読み込むたびに onLineRead を呼ぶ。 */
-    async load(
-        onLineRead: (line: string) => void,
-        finishCallback: () => void,
-        errorCallback: (e: any) => void
-    ): Promise<void> {
-        try {
-            await this.init_();
+        this.abortController_.signal.throwIfAborted();
 
-            let line: string | null;
-            while ((line = await this.readLine_()) !== null) {
-                onLineRead(line);
-            }
-            if (this.canceled_) 
-                return;
-            finishCallback();
-        } catch (e) {
-            errorCallback(e);
+        // 終端で進捗を 100%
+        this.bytesRead_ = this.fileSize_;
+
+        push(false);
+
+        if (record.length) {
+            yield record;
         }
     }
 
     cancel() {
         if (this.reader_) {
             this.reader_.cancel();
-            this.canceled_ = true;
+            this.abortController_.abort();
         }
     }
 }
