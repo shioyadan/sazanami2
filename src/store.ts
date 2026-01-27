@@ -2,13 +2,13 @@
 import { Loader } from "./loader";
 import { ViewDefinition, DataView, inferViewDefinition, createDataView, INITIAL_VIEW_DEFINITION } from "./data_view";
 import { Settings } from "./settings";
-import { FileLineReader } from "./file_line_reader";
+import { FileRecordReader } from "./file_record_reader";
 import { RendererContext, INITIAL_RENDERER_CONTEXT } from "./canvas_renderer";
 
 // ACTION は ACTION_END の直前に追加していく（CHANGE の開始値に影響するため）
 enum ACTION {
     FILE_LOAD_FROM_FILE_OBJECT,
-    FILE_LOAD_FROM_FILE_LINE_READER,
+    FILE_LOAD_FROM_FILE_RECORD_READER,
     FILE_LOAD_FROM_URL,
     DIALOG_VERSION_OPEN,
     DIALOG_HELP_OPEN,
@@ -108,31 +108,17 @@ class Store {
         
         // ---------------- ファイルロード ----------------
         this.on(ACTION.FILE_LOAD_FROM_FILE_OBJECT, (file: File) => {
-            const reader = new FileLineReader({ file });
-            this.trigger(ACTION.FILE_LOAD_FROM_FILE_LINE_READER, reader);
+            const reader = new FileRecordReader({ file });
+            this.trigger(ACTION.FILE_LOAD_FROM_FILE_RECORD_READER, reader);
         });
-        this.on(ACTION.FILE_LOAD_FROM_FILE_LINE_READER, (fileLineReader: FileLineReader) => {
+        this.on(ACTION.FILE_LOAD_FROM_FILE_RECORD_READER, (fileRecordReader: FileRecordReader) => {
             this.saveDefinition();
             // 新規ファイル読み込み時は ViewDefinition をリセット
             this.patchState({ viewDef: INITIAL_VIEW_DEFINITION });
             this.trigger(CHANGE.FILE_LOADING_START);
 
             this.loader.load(
-                fileLineReader,
-                (lines: number, elapsedMs: number) => {
-                    // ロード完了
-                    this.trigger(CHANGE.FILE_LOADING_END);
-                    this.trigger(CHANGE.FILE_LOADED);
-                    // ヘッダが揃ったことを通知（Editor の候補更新用）
-                    this.trigger(CHANGE.HEADERS_CHANGED, this.loader.headers);
-                    // キャンバス再描画など
-                    this.trigger(CHANGE.CONTENT_UPDATED);
-
-                    // メッセージ
-                    let message = `File loaded successfully: ${lines} lines in ${elapsedMs} ms`;
-                    this.trigger(CHANGE.SHOW_MESSAGE_IN_STATUS_BAR, message);
-                    this.trigger(ACTION.LOG_ADD, message);
-                },
+                fileRecordReader,
                 () => {
                     // フォーマット検出完了
                     let key = (this.loader.headers ?? []).join("--");
@@ -146,7 +132,7 @@ class Store {
                     applyDefinition(def);
                     this.trigger(CHANGE.FILE_FORMAT_DETECTED);
                 },
-                (percent, _lineNum) => {
+                (percent, _recordNum) => {
                     // 進捗
                     this.trigger(CHANGE.FILE_LOAD_PROGRESS, percent);
                     this.trigger(CHANGE.SHOW_MESSAGE_IN_STATUS_BAR, `${Math.floor(percent * 100)}% Loaded`);
@@ -154,16 +140,32 @@ class Store {
                         { ...this.state_.renderCtx, numRows: this.loader.numRows });
                     this.trigger(CHANGE.CONTENT_UPDATED);
                 },
-                (err) => {
-                    console.error(`Error loading file: ${err}`);
-                    this.trigger(CHANGE.FILE_LOADING_END);
-                    this.trigger(CHANGE.SHOW_MESSAGE_IN_STATUS_BAR, "Failed to load file");
-                    this.trigger(ACTION.LOG_ADD, "File load failed: " + err);
-                },
                 (msg) => { // warning
                     this.trigger(ACTION.LOG_ADD, msg);
                 }
-            );
+            ).then(([records, elapsedMs]) => {
+                // ロード完了
+                this.trigger(CHANGE.FILE_LOADING_END);
+                this.trigger(CHANGE.FILE_LOADED);
+                // ヘッダが揃ったことを通知（Editor の候補更新用）
+                this.trigger(CHANGE.HEADERS_CHANGED, this.loader.headers);
+                // キャンバス再描画など
+                this.trigger(CHANGE.CONTENT_UPDATED);
+
+                // メッセージ
+                let message = `File loaded successfully: ${records} records in ${elapsedMs} ms`;
+                this.trigger(CHANGE.SHOW_MESSAGE_IN_STATUS_BAR, message);
+                this.trigger(ACTION.LOG_ADD, message);
+            }, (err) => {
+                if (err.name == "AbortError") {
+                    return;
+                }
+
+                console.error(`Error loading file: ${err}`);
+                this.trigger(CHANGE.FILE_LOADING_END);
+                this.trigger(CHANGE.SHOW_MESSAGE_IN_STATUS_BAR, "Failed to load file");
+                this.trigger(ACTION.LOG_ADD, "File load failed: " + err);
+            });
         });
 
         this.on(ACTION.DIALOG_VERSION_OPEN, () => { this.trigger(CHANGE.DIALOG_VERSION_OPEN); });
@@ -246,10 +248,10 @@ class Store {
             if (!url) return;
 
             try {
-                const reader = new FileLineReader({url});
+                const reader = new FileRecordReader({url});
                 // 既存の読み込みフローへ
                 this.trigger(ACTION.LOG_ADD, `Loading from URL: ${url}`);
-                this.trigger(ACTION.FILE_LOAD_FROM_FILE_LINE_READER, reader);
+                this.trigger(ACTION.FILE_LOAD_FROM_FILE_RECORD_READER, reader);
             } catch (e) {
                 console.error(e);
                 this.trigger(CHANGE.SHOW_MESSAGE_IN_STATUS_BAR, "Failed to fetch ?file= URL");
