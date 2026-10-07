@@ -175,9 +175,15 @@ class CanvasRenderer {
         const plotWidth = Math.max(width - this.MARGIN_LEFT_, 0);
         if (plotHeight <= 0 || plotWidth <= 0) return;
 
-        // 表示セル数
-        const visibleCols = Math.ceil(plotWidth / scaleXVal);
-        const visibleRows = Math.ceil(plotHeight / scaleYVal);
+        // データ座標での表示範囲。端数のスクロール位置でも端のセルを含める。
+        const xMin = offsetX / scaleXVal;
+        const yMin = offsetY / scaleYVal;
+        const xMax = (offsetX + plotWidth) / scaleXVal;
+        const yMax = (offsetY + plotHeight) / scaleYVal;
+        const xStart = Math.floor(xMin);
+        const yStart = Math.floor(yMin);
+        const visibleCols = Math.ceil(xMax) - xStart;
+        const visibleRows = Math.ceil(yMax) - yStart;
 
         // グリッドの上限を設定
         const MAX_RES = 128;
@@ -191,11 +197,10 @@ class CanvasRenderer {
         const pxW = Math.max(scaleXVal, renderCtx.minPlotWidth);
         const pxH = Math.max(scaleYVal, renderCtx.minPlotHeight);
 
-        // 描画セルの start/end インデックス
-        const xStart = Math.floor((offsetX - this.MARGIN_LEFT_) / scaleXVal);
-        const yStart = Math.floor(offsetY / scaleYVal);
-        const startIdx = dataView.getStartIdx(xStart, yStart);
-        const endIdx   = dataView.getEndIdx(xStart + visibleCols - 1, yStart + visibleRows - 1);
+        // 左・上には、最小描画サイズによって画面内へ重なる点も含める。
+        // 終端を整数へ丸めず、部分表示のセルや派生列の小数座標も描画対象にする。
+        const startIdx = dataView.getStartIdx(xMin - pxW / scaleXVal, yMin - pxH / scaleYVal);
+        const endIdx = dataView.getEndIdx(xMax, yMax);
 
         // drawnIndex を gridCols × gridRows で初期化
         if (gridMap.drawnIndex?.length != gridCols * gridRows) {
@@ -325,16 +330,15 @@ class CanvasRenderer {
         // 可視セル数（カラム数・行数）
         const scaleXVal = scaleX(renderCtx.scaleXLog);
         const scaleYVal = scaleY(renderCtx.scaleYLog);
-        const visibleCols = Math.ceil((renderCtx.width - this.MARGIN_LEFT_) / scaleXVal);
-        const visibleRows = Math.ceil(plotHeight / scaleYVal);
+        const xStart = Math.floor(renderCtx.offsetX / scaleXVal);
+        const yStart = Math.floor(renderCtx.offsetY / scaleYVal);
+        const visibleCols = Math.ceil((renderCtx.offsetX + renderCtx.width - this.MARGIN_LEFT_) / scaleXVal) - xStart;
+        const visibleRows = Math.ceil((renderCtx.offsetY + plotHeight) / scaleYVal) - yStart;
 
         // 最大解像度制限
         const MAX_RES = 128;
         const gridCols = Math.min(visibleCols, MAX_RES);
         const gridRows = Math.min(visibleRows, MAX_RES);
-
-        const xStart = Math.floor((renderCtx.offsetX - this.MARGIN_LEFT_) / scaleXVal);
-        const yStart = Math.floor(renderCtx.offsetY / scaleYVal);
 
         const xVal = Math.floor((mouseX - this.MARGIN_LEFT_ + renderCtx.offsetX) / scaleXVal);
         const yVal = Math.floor((mouseY + renderCtx.offsetY) / scaleYVal);

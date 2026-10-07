@@ -58,8 +58,8 @@ downloads the fixed latest archive and asks before replacing its adjacent launch
 It updates to the development version even when run from a versioned release. `SAZANAMI2_UPDATE_URL`
 can select another archive for a mirror or local testing. Only the named app files are extracted.
 
-`make check` runs TypeScript checks, the launcher/update tests, a production build, and a check
-that the HTML embeds its scripts and styles. It does not run browser interaction tests.
+`make check` runs TypeScript checks, rendering regression tests, launcher/update tests, a production
+build, and a check that the HTML embeds its scripts and styles. It does not run browser interaction tests.
 
 ## Publish a release
 

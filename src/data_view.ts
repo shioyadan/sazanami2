@@ -445,6 +445,18 @@ export class DataView {
         return lo;
     }
 
+    // targetと同じ値の行もすべて含め、その次の位置を返す。
+    upperBound_(col: ColumnInterface, target: number): number {
+        let lo = 0;
+        let hi = this.numRows_;
+        while (lo < hi) {
+            const mid = Math.floor((lo + hi) / 2);
+            if (col.getNumber(mid) <= target) lo = mid + 1;
+            else hi = mid;
+        }
+        return lo;
+    }
+
     getStartIdx(xStart: number, yStart: number): number {
         const xDeviationZero = this.xCol_.stat.deviationFromMax === 0;
         const yDeviationZero = this.yCol_.stat.deviationFromMax === 0;
@@ -469,8 +481,9 @@ export class DataView {
         const xDeviationZero = this.xCol_.stat.deviationFromMax === 0;
         const yDeviationZero = this.yCol_.stat.deviationFromMax === 0;
 
-        const xIndexEnd = Math.min(this.lowerBound_(this.xCol_, xEnd), this.numRows_);
-        const yIndexEnd = Math.min(this.lowerBound_(this.yCol_, yEnd), this.numRows_);
+        // 描画ループは終端を含むため、最後の対象行のindexを返す。
+        const xIndexEnd = this.upperBound_(this.xCol_, xEnd) - 1;
+        const yIndexEnd = this.upperBound_(this.yCol_, yEnd) - 1;
         
         if (xDeviationZero && yDeviationZero) {
             return Math.max(xIndexEnd, yIndexEnd);
@@ -482,7 +495,7 @@ export class DataView {
             return yIndexEnd;
         }
 
-        return this.numRows_; // 両方に偏差がある場合は全体を走査
+        return this.numRows_ - 1; // 両方に偏差がある場合は全体を走査
     }
 
     getMaxX(): number { return this.xCol_.stat.max; }

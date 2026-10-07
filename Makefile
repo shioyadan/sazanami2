@@ -1,7 +1,7 @@
 .DEFAULT_GOAL := all
 
 .PHONY: all production serve init clean docker-run docker-build pack launcher-check \
-	typecheck check archive latest-archive release-archive release-version-check
+	typecheck test check archive latest-archive release-archive release-version-check
 
 BUILD_ID := $(shell git show -s --format=%ct-%h-%cs HEAD)
 PACKAGE_VERSION := $(shell node -p 'require("./package.json").version')
@@ -39,8 +39,12 @@ launcher-check:
 typecheck:
 	./node_modules/.bin/tsc --noEmit
 
+test:
+	node test/canvas_renderer_test.js
+
 check:
 	$(MAKE) typecheck
+	$(MAKE) test
 	$(MAKE) launcher-check
 	$(MAKE) production
 	python3 test/single_html_smoke.py dist/index.html

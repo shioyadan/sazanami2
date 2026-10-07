@@ -129,7 +129,7 @@ make init             # Install dependencies and regenerate the third-party lice
 make                  # Build the development application
 make serve            # Start the development server
 make production       # Build dist/index.html and the launcher
-make check            # Check types, launcher behavior, and the production HTML
+make check            # Check types, rendering, launcher behavior, and the production HTML
 make latest-archive   # Verify and package dist-release/sazanami2-latest.zip
 make release-archive  # Verify and package a versioned ZIP
 ```
