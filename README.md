@@ -70,6 +70,10 @@ Zstandard-compressed files (`.zst`) can be opened directly.
 View definitions can be imported and exported as JSON from the settings panel. The app also saves
 view definitions for matching column headers between browser sessions.
 
+Indexes for the active axes are built on demand within a memory budget. Index construction and
+large-view preparation run incrementally so you can continue interacting with the app. WebGL
+overview rendering combines points covering the same pixels and retains the last row's color.
+
 ### Load data from a server
 
 When hosting the HTML alongside data files, the `file` URL parameter loads a file automatically:

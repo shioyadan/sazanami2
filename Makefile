@@ -40,7 +40,7 @@ typecheck:
 	./node_modules/.bin/tsc --noEmit
 
 test:
-	node test/canvas_renderer_test.js
+	node --test test/*_test.js
 
 check:
 	$(MAKE) typecheck

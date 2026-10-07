@@ -1,5 +1,6 @@
 import { FileLineReader, FileLineReaderOptions } from "./file_line_reader";
 import { inferViewDefinition, ViewDefinition, DataView, isEqualViewDefinition, createDataView } from "./data_view";
+import { AxisIndexCache } from "./axis_index";
 
 export const columnDec = {
     toString(value: number | string) {
@@ -115,6 +116,11 @@ class Loader {
     // DataView のキャッシュ
     private dataView_: DataView | null = null;
     private dataViewInvalidated_: boolean = false;
+    readonly axisIndexes = new AxisIndexCache();
+    onViewUpdated: (() => void) | null = null;
+    private loading_ = false;
+    private derivedColumns_ = new Map<string, ColumnInterface>();
+    private derivedRows_ = -1;
 
     // 型検出用
     private rawBuffer_: { [column: string]: string[] } = {};
@@ -141,6 +147,10 @@ class Loader {
     }
 
     reset() {
+        this.axisIndexes.clear();
+        this.derivedColumns_.clear();
+        this.derivedRows_ = -1;
+        this.loading_ = false;
         this.lineNum = 1;
         this.numRows_ = 0;
         this.numWarning = 0;
@@ -174,6 +184,7 @@ class Loader {
         this.onFormatDetected_ = formatDetected;
         this.warningCallback_ = warningCallback;
         this.reader_ = reader;
+        this.loading_ = true;
         this.startTime_ = (new Date()).getTime();
 
         reader.load(
@@ -190,10 +201,12 @@ class Loader {
                     this.finalizeTypes_();
                 }
                 this.dataViewInvalidated_ = true;   // max を更新した可能性があるので invalidate
+                this.loading_ = false;
                 let elapsed = ((new Date()).getTime() - this.startTime_);
                 finishCallback(this.lineNum - 1, elapsed);
             },
             (error: any) => {   // onError
+                this.loading_ = false;
                 errorCallback(error, this.lineNum);
             }
         );
@@ -498,7 +511,25 @@ class Loader {
             this.dataView_ = createDataView(this, dataViewDef);
             this.dataViewInvalidated_ = false;
         }
+        this.dataView_.prepareIndexes();
         return this.dataView_;
+    }
+
+    public derivedColumn(key: string, create: () => ColumnInterface): ColumnInterface {
+        if (this.derivedRows_ !== this.numRows_) {
+            this.derivedColumns_.clear();
+            this.derivedRows_ = this.numRows_;
+        }
+        let column = this.derivedColumns_.get(key);
+        if (!column) {
+            column = create();
+            this.derivedColumns_.set(key, column);
+        }
+        return column;
+    }
+
+    public prepareIndexes(columns: ColumnInterface[]): void {
+        if (!this.loading_) this.axisIndexes.prepare(columns, this.numRows_, () => this.onViewUpdated?.());
     }
 }
 

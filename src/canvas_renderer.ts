@@ -41,6 +41,8 @@ class GridMap {
     drawnIndex: Int32Array | null = null; 
 }
 
+type PixelScale = { x: number; y: number };
+
 class CanvasRenderer {
     MARGIN_LEFT_ = 50;
     MARGIN_BOTTOM_ = 20;
@@ -48,6 +50,92 @@ class CanvasRenderer {
     ZOOM_STEP_LOG_ = Math.log(1.3); // 対数ズーム量
 
     rectRenderer: RectRendererSoft|RectRendererWebGL;
+    private rowCache_: { view: DataView; context: RendererContext; pixelRatio: PixelScale; rows: Uint32Array } | null = null;
+    private pendingRows_: { view: DataView; context: RendererContext; pixelRatio: PixelScale } | null = null;
+    private rowGeneration_ = 0;
+
+    private sameViewport(a: RendererContext, b: RendererContext): boolean {
+        return a.width === b.width && a.height === b.height && a.offsetX === b.offsetX && a.offsetY === b.offsetY &&
+            a.scaleXLog === b.scaleXLog && a.scaleYLog === b.scaleYLog &&
+            a.minPlotWidth === b.minPlotWidth && a.minPlotHeight === b.minPlotHeight;
+    }
+
+    cancelPendingRows(): void {
+        this.rowGeneration_++;
+        this.pendingRows_ = null;
+        this.rowCache_ = null;
+    }
+
+    private *selectRows(view: DataView, context: RendererContext, pixelRatio: PixelScale, selection: ReturnType<DataView["getVisibleRows"]>): Generator<void, Uint32Array> {
+        const sx = scaleX(context.scaleXLog), sy = scaleY(context.scaleYLog);
+        const width = context.width - this.MARGIN_LEFT_, height = context.height - this.MARGIN_BOTTOM_;
+        const pointWidth = Math.max(sx, context.minPlotWidth), pointHeight = Math.max(sy, context.minPlotHeight);
+        const pixelWidth = Math.ceil(context.width * pixelRatio.x), pixelHeight = Math.ceil(context.height * pixelRatio.y);
+        const xBase = pixelWidth + 1, yBase = pixelHeight + 1;
+        // 同じ画素範囲へ重なる点は、元の入力順で最後の行を残す。
+        const aggregate = !(this.rectRenderer instanceof RectRendererSoft) && selection.end - selection.start > 100000 &&
+            xBase * xBase * yBase * yBase < Number.MAX_SAFE_INTEGER;
+        const pixels = aggregate ? new Map<number, number>() : null;
+        const rows: number[] = [];
+        for (let position = selection.start; position < selection.end; position++) {
+            if ((position & 2047) === 0) yield;
+            const row = selection.order ? selection.order[position] : position;
+            const y = view.getY(row) * sy - context.offsetY;
+            if (!Number.isFinite(y) || y + pointHeight < 0 || y >= height) continue;
+            const x = this.MARGIN_LEFT_ + view.getX(row) * sx - context.offsetX;
+            if (!Number.isFinite(x) || x + pointWidth < this.MARGIN_LEFT_ || x >= context.width) continue;
+            if (pixels) {
+                const x0 = Math.max(0, Math.ceil(x * pixelRatio.x - 0.5));
+                const x1 = Math.min(pixelWidth, Math.ceil((x + pointWidth) * pixelRatio.x - 0.5));
+                const y0 = Math.max(0, Math.ceil(y * pixelRatio.y - 0.5));
+                const y1 = Math.min(pixelHeight, Math.ceil((y + pointHeight) * pixelRatio.y - 0.5));
+                if (x0 >= x1 || y0 >= y1) continue;
+                const key = ((y0 * xBase + x0) * yBase + y1) * xBase + x1;
+                const previous = pixels.get(key);
+                if (previous === undefined || row > previous) pixels.set(key, row);
+            } else rows.push(row);
+        }
+        const result = Uint32Array.from(pixels ? pixels.values() : rows);
+        // 索引の値順ではなく元の行順で描き、重なりの色を変えない。
+        result.sort();
+        return result;
+    }
+
+    private prepareRows(view: DataView, context: RendererContext, pixelRatio: PixelScale, requestDraw?: () => void): Uint32Array | null {
+        if (this.rowCache_?.view === view && this.rowCache_.pixelRatio.x === pixelRatio.x && this.rowCache_.pixelRatio.y === pixelRatio.y && this.sameViewport(this.rowCache_.context, context)) {
+            if (this.pendingRows_) { this.rowGeneration_++; this.pendingRows_ = null; }
+            return this.rowCache_.rows;
+        }
+        if (this.pendingRows_?.view === view && this.pendingRows_.pixelRatio.x === pixelRatio.x && this.pendingRows_.pixelRatio.y === pixelRatio.y && this.sameViewport(this.pendingRows_.context, context)) return null;
+        const generation = ++this.rowGeneration_;
+        this.pendingRows_ = null;
+        const sx = scaleX(context.scaleXLog), sy = scaleY(context.scaleYLog);
+        const range = view.getVisibleRows((context.offsetX - Math.max(sx, context.minPlotWidth)) / sx,
+            (context.offsetY - Math.max(sy, context.minPlotHeight)) / sy,
+            (context.offsetX + context.width - this.MARGIN_LEFT_) / sx,
+            (context.offsetY + context.height - this.MARGIN_BOTTOM_) / sy);
+        const selection = this.selectRows(view, context, pixelRatio, range);
+        if (requestDraw && range.end - range.start > 100000) {
+            this.pendingRows_ = { view, context, pixelRatio };
+            const advance = () => {
+                if (generation !== this.rowGeneration_) return;
+                const deadline = performance.now() + 6;
+                let next;
+                do { next = selection.next(); } while (!next.done && performance.now() < deadline);
+                if (next.done) {
+                    this.rowCache_ = { view, context, pixelRatio, rows: next.value };
+                    this.pendingRows_ = null;
+                    requestDraw();
+                } else setTimeout(advance, 0);
+            };
+            setTimeout(advance, 0);
+            return null;
+        }
+        let next;
+        do { next = selection.next(); } while (!next.done);
+        this.rowCache_ = { view, context, pixelRatio, rows: next.value };
+        return next.value;
+    }
 
     constructor() {
         let rendererGL = new RectRendererWebGL();
@@ -156,7 +244,7 @@ class CanvasRenderer {
     }
 
 
-    draw(canvas: HTMLCanvasElement, gridMap: GridMap, dataView: DataView | null, renderCtx: RendererContext) {
+    draw(canvas: HTMLCanvasElement, gridMap: GridMap, dataView: DataView | null, renderCtx: RendererContext, requestDraw?: () => void) {
         let canvasCtx = canvas.getContext("2d")!;
         if (!canvasCtx) return;
 
@@ -166,14 +254,16 @@ class CanvasRenderer {
         const scaleXVal = scaleX(renderCtx.scaleXLog);
         const scaleYVal = scaleY(renderCtx.scaleYLog);
 
-        this.clear(canvasCtx, renderCtx);
-
-        if (!dataView) return;
+        if (!dataView) {
+            this.cancelPendingRows();
+            this.clear(canvasCtx, renderCtx);
+            return;
+        }
 
         // プロット領域がサイズ０となると色々壊れるのでリターン
         const plotHeight = Math.max(height - this.MARGIN_BOTTOM_, 0);
         const plotWidth = Math.max(width - this.MARGIN_LEFT_, 0);
-        if (plotHeight <= 0 || plotWidth <= 0) return;
+        if (plotHeight <= 0 || plotWidth <= 0) { this.cancelPendingRows(); return; }
 
         // データ座標での表示範囲。端数のスクロール位置でも端のセルを含める。
         const xMin = offsetX / scaleXVal;
@@ -190,17 +280,22 @@ class CanvasRenderer {
         const gridCols = Math.min(visibleCols, MAX_RES);
         const gridRows = Math.min(visibleRows, MAX_RES);
 
-        // 1ピクセルに描画される論理高さ
-        const ratioY = 1 / scaleYVal; 
-
         // データ描画用ピクセルサイズ
         const pxW = Math.max(scaleXVal, renderCtx.minPlotWidth);
         const pxH = Math.max(scaleYVal, renderCtx.minPlotHeight);
 
         // 左・上には、最小描画サイズによって画面内へ重なる点も含める。
         // 終端を整数へ丸めず、部分表示のセルや派生列の小数座標も描画対象にする。
-        const startIdx = dataView.getStartIdx(xMin - pxW / scaleXVal, yMin - pxH / scaleYVal);
-        const endIdx = dataView.getEndIdx(xMax, yMax);
+        const pixelRatio = {
+            x: canvas.width && canvas.clientWidth ? canvas.width / canvas.clientWidth : 1,
+            y: canvas.height && canvas.clientHeight ? canvas.height / canvas.clientHeight : 1
+        };
+        const rows = this.prepareRows(dataView, renderCtx, pixelRatio, requestDraw);
+        if (!rows) {
+            gridMap.drawnIndex = null;
+            return;
+        }
+        this.clear(canvasCtx, renderCtx);
 
         // drawnIndex を gridCols × gridRows で初期化
         if (gridMap.drawnIndex?.length != gridCols * gridRows) {
@@ -213,19 +308,12 @@ class CanvasRenderer {
         const gridColRatio = gridCols / visibleCols;
         const gridRowRatio = gridRows / visibleRows;
 
-        // 描画まびき
-        // X 方向の密度に応じても間引き量をかえる
-        const avgNumPointX = (dataView.getEndIdx(Infinity,Infinity) - dataView.getStartIdx(-Infinity, -Infinity) + 1) / (dataView.getMaxY() - dataView.getMinY() + 1);
-        let step = Math.max(1, Math.floor(ratioY * avgNumPointX / 4 / 32));
-
-        if (endIdx - startIdx < 100000) step = 1; // 少ない場合は間引かない
-
         // データ描画＆インデックス記録
         this.rectRenderer.beginRawMode(canvas, scaleYVal);
 
         let colorPalette = dataView.getPalette();
 
-        for (let i = startIdx; i <= endIdx; i += step) {
+        for (const i of rows) {
             const yVal = dataView.getY(i);
             const y = yVal * scaleYVal - offsetY;
             if (y + pxH < 0) continue;
@@ -250,10 +338,6 @@ class CanvasRenderer {
                 const gridRow = Math.floor(row * gridRowRatio);
                 const cellIndex = gridRow * gridCols + gridCol;
                 gridMap.drawnIndex[cellIndex] = i;
-            }
-            // モアレを軽減するために適当にノイズを乗せる
-            if (step > 1) {
-                i += ((((i * 17) >> 5) ^ ((i * 31) >> 10)) & 7) == 0 ? 1 : 0;
             }
         }
         this.rectRenderer.endRawMode();
@@ -403,7 +487,7 @@ class CanvasRenderer {
             clamped = true;
         }
 
-        const SAFE_MIN = 1e-6;
+        const SAFE_MIN = Number.MIN_VALUE;
         const nextScaleXLog = Math.log(Math.max(fitScaleX, SAFE_MIN));
         const nextScaleYLog = Math.log(Math.max(fitScaleY, SAFE_MIN));
 

@@ -49,6 +49,7 @@ enum CHANGE {
     LOG_ADDED,                // payload: LogEntry
     LOG_CLEARED,
     LOG_OVERLAY_VISIBILITY_CHANGED, // payload: boolean
+    AXIS_INDEX_PROGRESS,     // payload: number | null
 };
 
 type StoreState = Readonly<{
@@ -104,6 +105,8 @@ class Store {
     constructor() {
         this.settings.load();
         this.loader = new Loader();
+        this.loader.onViewUpdated = () => this.trigger(CHANGE.CONTENT_UPDATED);
+        this.loader.axisIndexes.onProgress = progress => this.trigger(CHANGE.AXIS_INDEX_PROGRESS, progress);
 
         
         // ---------------- ファイルロード ----------------

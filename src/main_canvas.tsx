@@ -41,7 +41,14 @@ const MainCanvas: React.FC<{ store: Store }> = ({ store }) => {
     useEffect(() => {
         const renderer = rendererRef.current;
         const gridMap = gridMapRef.current;
-        const draw = () => renderer.draw(canvasRef.current!, gridMap, store.loader.GetDataView(store.state.viewDef), store.state.renderCtx);
+        let drawRaf: number | null = null;
+        const draw = () => {
+            if (drawRaf !== null) return;
+            drawRaf = requestAnimationFrame(() => {
+                drawRaf = null;
+                renderer.draw(canvasRef.current!, gridMap, store.loader.GetDataView(store.state.viewDef), store.state.renderCtx, draw);
+            });
+        };
 
         const canvas = canvasRef.current!;
         const div = divRef.current!;
@@ -541,6 +548,7 @@ const MainCanvas: React.FC<{ store: Store }> = ({ store }) => {
 
         // Store change handler
         const onFileLoadStarted = () => {
+            renderer.cancelPendingRows();
             const next = { ...store.state.renderCtx, numRows: 0 };
             store.trigger(ACTION.UPDATE_RENDERER_CONTEXT, next);
             handleResize();
@@ -574,17 +582,26 @@ const MainCanvas: React.FC<{ store: Store }> = ({ store }) => {
         store.on(CHANGE.FILE_LOADING_START, onFileLoadStarted);
         store.on(CHANGE.FILE_FORMAT_DETECTED, onFileFormatDetected);
         store.on(CHANGE.CONTENT_UPDATED, onContentUpdated);
-        store.on(CHANGE.CANVAS_FIT, () => {
+        const onFit = () => {
             const dataView = store.loader.GetDataView(store.state.viewDef);
             const next = renderer.fitScaleToData(dataView, store.state.renderCtx, 1.0);
             store.trigger(ACTION.UPDATE_RENDERER_CONTEXT, next);
             draw();
-        });
+        };
+        store.on(CHANGE.CANVAS_FIT, onFit);
 
         // Cleanup
         return () => {
             cancelZoomAnimation();
             cancelPanAnimation();
+            if (drawRaf !== null) cancelAnimationFrame(drawRaf);
+            renderer.cancelPendingRows();
+            ro.disconnect();
+            store.off(CHANGE.FILE_LOADED, onContentUpdated);
+            store.off(CHANGE.FILE_LOADING_START, onFileLoadStarted);
+            store.off(CHANGE.FILE_FORMAT_DETECTED, onFileFormatDetected);
+            store.off(CHANGE.CONTENT_UPDATED, onContentUpdated);
+            store.off(CHANGE.CANVAS_FIT, onFit);
             div.removeEventListener("wheel", handleWheel);
             window.removeEventListener("keydown", handleKeyDown);
             canvas.removeEventListener("mousedown", handleMouseDown);

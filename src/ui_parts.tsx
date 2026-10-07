@@ -138,10 +138,11 @@ const StatusBar = (props: {store: Store;}) => {
     );
 };
 
-/** ファイルロード中のプログレスバー（ツールバー直下に表示） */
+/** 読み込みと索引生成のプログレスバーをツールバー直下へ積む。 */
 const LoadingBar: React.FC<{ store: Store }> = ({ store }) => {
     const [visible, setVisible] = useState(false);
     const [progress, setProgress] = useState<number | null>(null); // null = 不定
+    const [indexProgress, setIndexProgress] = useState<number | null>(store.loader.axisIndexes.progress);
 
     useEffect(() => {
         const onStart = () => { setVisible(true); setProgress(null); };
@@ -153,25 +154,35 @@ const LoadingBar: React.FC<{ store: Store }> = ({ store }) => {
         store.on(CHANGE.FILE_LOADING_START, onStart);
         store.on(CHANGE.FILE_LOAD_PROGRESS, onProgress);
         store.on(CHANGE.FILE_LOADING_END, onEnd);
+        store.on(CHANGE.AXIS_INDEX_PROGRESS, setIndexProgress);
+        setIndexProgress(store.loader.axisIndexes.progress);
 
         return () => {
             store.off(CHANGE.FILE_LOADING_START, onStart);
             store.off(CHANGE.FILE_LOAD_PROGRESS, onProgress);
             store.off(CHANGE.FILE_LOADING_END, onEnd);
+            store.off(CHANGE.AXIS_INDEX_PROGRESS, setIndexProgress);
         };
     }, [store]);
 
-    if (!visible) return null;
-
     return (
-        <div style={{ background: "transparent"}}>
-            <div
-                style={{
-                    height: "2px",
-                    width: progress != null ? `${progress}%` : "0%",
-                    backgroundColor: "#007bff", // 青
-                }}
-            />
+        // 表示の開始・終了でCanvasの高さが変わり、表示準備をやり直すことを避ける。
+        <div style={{ height: "4px", flexShrink: 0, backgroundColor: "#272a31" }}>
+            <div style={{ height: "2px" }}>
+                {visible && <div
+                    role="progressbar" aria-label="Loading file"
+                    aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress ?? undefined}
+                    style={{ height: "2px", width: progress != null ? `${progress}%` : "0%", backgroundColor: "#007bff" }}
+                />}
+            </div>
+            <div style={{ height: "2px" }}>
+                {indexProgress !== null && <div
+                    role="progressbar" aria-label="Indexing axes"
+                    aria-valuemin={0} aria-valuemax={100} aria-valuenow={indexProgress * 100}
+                    title={`Indexing axes: ${Math.floor(indexProgress * 100)}%`}
+                    style={{ height: "2px", width: `${indexProgress * 100}%`, backgroundColor: "#f0ad4e" }}
+                />}
+            </div>
         </div>
     );
 };

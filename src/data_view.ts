@@ -160,6 +160,7 @@ class ExpressionProjector {
             this.fastExp_ = (i: number) => c0.getNumber(i);
             this.min_ = c0.stat.min;
             this.max_ = c0.stat.max;
+            this.deviationFromMax_ = c0.stat.deviationFromMax;
             return;
         }
 
@@ -169,35 +170,27 @@ class ExpressionProjector {
         const body = `return (${rewritten});`;
         this.compiledExp_ = new Function(...argNames, body) as (...args: number[]) => number;
 
-        // min/max 推定（列 min/max を用いたコーナー評価）
+        // 式の端点だけでは剰余や減少する式の範囲・単調性を判定できない。
         const k = this.cols_.length;
         if (k === 0) {
             const v = (this.compiledExp_ as () => number)();
             this.min_ = v;
             this.max_ = v;
             this.deviationFromMax_ = 0;
-        } else if (k === 1) {
-            const c0 = this.cols_[0];
-            const a = (this.compiledExp_ as (v0raw: number) => number)(c0.stat.min);
-            const b = (this.compiledExp_ as (v0raw: number) => number)(c0.stat.max);
-            this.min_ = Math.min(a, b);
-            this.max_ = Math.max(a, b);
-            this.deviationFromMax_ = c0.stat.deviationFromMax;
         } else {
-            const c0 = this.cols_[0];
-            const c1 = this.cols_[1];
-            const eval2 = this.compiledExp_ as (v0raw: number, v1raw: number) => number;
-            const v00 = eval2(c0.stat.min, c1.stat.min);
-            const v01 = eval2(c0.stat.min, c1.stat.max);
-            const v10 = eval2(c0.stat.max, c1.stat.min);
-            const v11 = eval2(c0.stat.max, c1.stat.max);
-            this.min_ = Math.min(v00, v01, v10, v11);
-            this.max_ = Math.max(v00, v01, v10, v11);
-            this.deviationFromMax_ = 
-                Math.min(
-                    this.max_ - this.min_,
-                    Math.max(c0.stat.deviationFromMax, c1.stat.deviationFromMax)
-                );
+            let min = Infinity, max = -Infinity;
+            for (let i = 0; i < numRows; i++) {
+                const value = this.value(i);
+                if (!Number.isFinite(value)) {
+                    this.deviationFromMax_ = Infinity;
+                    continue;
+                }
+                this.deviationFromMax_ = Math.max(this.deviationFromMax_, max - value);
+                min = Math.min(min, value);
+                max = Math.max(max, value);
+            }
+            this.min_ = Number.isFinite(min) ? min : 0;
+            this.max_ = Number.isFinite(max) ? max : 0;
         }
     }
 
@@ -284,9 +277,11 @@ class VirtualColumnRegistry {
         };
 
         for (const [name, expr] of this.defs_) {
-            const projector = new ExpressionProjector();
-            projector.init(resolveColumn, expr, this.numRows_);
-            const col = new ExpressionColumn(name, projector);
+            const col = this.loader_.derivedColumn(`${name}\0${expr}`, () => {
+                const projector = new ExpressionProjector();
+                projector.init(resolveColumn, expr, this.numRows_);
+                return new ExpressionColumn(name, projector);
+            });
             this.columns_.set(name, col);
         }
     }
@@ -404,6 +399,31 @@ export class DataView {
     getX(i: number): number { return this.xCol_.getNumber(i); }
     getY(i: number): number { return this.yCol_.getNumber(i); }
 
+    prepareIndexes(): void { this.loaderRef_.prepareIndexes([this.xCol_, this.yCol_]); }
+
+    getVisibleRows(xMin: number, yMin: number, xMax: number, yMax: number): { order: Uint32Array | null; start: number; end: number } {
+        let selection: { order: Uint32Array | null; start: number; end: number } = {
+            order: null, start: this.getStartIdx(xMin, yMin), end: this.getEndIdx(xMax, yMax) + 1
+        };
+        for (const [column, min, max] of [[this.xCol_, xMin, xMax], [this.yCol_, yMin, yMax]] as const) {
+            const order = this.loaderRef_.axisIndexes.get(column);
+            if (!order) continue;
+            const bound = (target: number, upper: boolean) => {
+                let lo = 0, hi = order.length;
+                while (lo < hi) {
+                    const mid = (lo + hi) >>> 1;
+                    const value = column.getNumber(order[mid]);
+                    if (upper ? value <= target : value < target) lo = mid + 1;
+                    else hi = mid;
+                }
+                return lo;
+            };
+            const start = bound(min, false), end = bound(max, true);
+            if (end - start < selection.end - selection.start) selection = { order, start, end };
+        }
+        return selection;
+    }
+
     xToString(val: number) { return this.xType_.toString(val); }
     yToString(val: number) { return this.yType_.toString(val); }
 
@@ -417,8 +437,9 @@ export class DataView {
 
         if (this.paletteContinuous_) {  // 連続値っぽい場合はスケーリングする
             const range = this.colorCol_.stat.max - this.colorCol_.stat.min;
+            if (!(range > 0)) return 0;
             const t = (v - this.colorCol_.stat.min) / range;
-            return Math.floor(t * this.paletteSize_);
+            return Math.max(0, Math.min(this.paletteSize_ - 1, Math.floor(t * this.paletteSize_)));
         }
         
         // 離散値っぽい場合は mod でそのまま丸める
@@ -461,11 +482,11 @@ export class DataView {
         const xDeviationZero = this.xCol_.stat.deviationFromMax === 0;
         const yDeviationZero = this.yCol_.stat.deviationFromMax === 0;
 
-        const xIndexStart = this.lowerBound_(this.xCol_, xStart);
-        const yIndexStart = this.lowerBound_(this.yCol_, yStart);
+        const xIndexStart = xDeviationZero ? this.lowerBound_(this.xCol_, xStart) : 0;
+        const yIndexStart = yDeviationZero ? this.lowerBound_(this.yCol_, yStart) : 0;
 
         if (xDeviationZero && yDeviationZero) {
-            return Math.min(xIndexStart, yIndexStart);
+            return Math.max(xIndexStart, yIndexStart);
         }
         if (xDeviationZero) {
             return xIndexStart;
@@ -482,11 +503,11 @@ export class DataView {
         const yDeviationZero = this.yCol_.stat.deviationFromMax === 0;
 
         // 描画ループは終端を含むため、最後の対象行のindexを返す。
-        const xIndexEnd = this.upperBound_(this.xCol_, xEnd) - 1;
-        const yIndexEnd = this.upperBound_(this.yCol_, yEnd) - 1;
+        const xIndexEnd = xDeviationZero ? this.upperBound_(this.xCol_, xEnd) - 1 : this.numRows_ - 1;
+        const yIndexEnd = yDeviationZero ? this.upperBound_(this.yCol_, yEnd) - 1 : this.numRows_ - 1;
         
         if (xDeviationZero && yDeviationZero) {
-            return Math.max(xIndexEnd, yIndexEnd);
+            return Math.min(xIndexEnd, yIndexEnd);
         }
         if (xDeviationZero) {
             return xIndexEnd;
