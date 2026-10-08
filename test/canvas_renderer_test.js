@@ -200,7 +200,7 @@ test("Horizontal zoom keeps a rare point in a large interleaved dataset", () => 
 
 test("Pixel aggregation preserves the final color of overlapping rectangles", () => {
     const n = 100003;
-    const csv = "x,y,color\n" + Array.from({ length: n }, (_, i) => `${i % 17},${i * 3 % 19},${i % 3}`).join("\n");
+    const csv = "x,y,color\n" + Array.from({ length: n }, (_, i) => `${Math.floor(i / 4) % 17},${Math.floor(i / 4) * 3 % 19},${i % 3}`).join("\n");
     const { loader, view } = load(csv, { view: { axisXField: "x", axisYField: "y", colorField: "color" }, columns: {} });
     const { renderer, rectangles, canvas } = makeRenderer();
     const context = { ...INITIAL_RENDERER_CONTEXT, width: 70, height: 40, offsetX: 0.25, offsetY: 0.75,
@@ -217,14 +217,17 @@ test("Pixel aggregation preserves the final color of overlapping rectangles", ()
         }
         return pixels;
     }
-    const full = Array.from({ length: n }, (_, i) => ({ x: 50 + view.getX(i) * Math.exp(context.scaleXLog) - 0.25, y: view.getY(i) * Math.exp(context.scaleYLog) - 0.75,
-        width: 3, height: 2, color: view.getPalette()[view.getColorIndex(i)] }));
-    for (const [rx, ry] of [[1, 1], [2, 2], [87 / 70, 1.25]]) {
-        canvas.clientWidth = 70; canvas.width = Math.round(70 * rx);
-        canvas.clientHeight = 40; canvas.height = Math.round(40 * ry);
-        renderer.draw(canvas, new GridMap(), view, context);
-        assert.ok(rectangles.length < 1000);
-        assert.deepEqual(paint(rectangles, rx, ry), paint(full, rx, ry));
+    for (const [minPlotWidth, minPlotHeight] of [[1, 1], [3, 2]]) {
+        const next = { ...context, minPlotWidth, minPlotHeight };
+        const full = Array.from({ length: n }, (_, i) => ({ x: 50 + view.getX(i) * Math.exp(context.scaleXLog) - 0.25, y: view.getY(i) * Math.exp(context.scaleYLog) - 0.75,
+            width: minPlotWidth, height: minPlotHeight, color: view.getPalette()[view.getColorIndex(i)] }));
+        for (const [rx, ry] of [[1, 1], [2, 2], [87 / 70, 1.25]]) {
+            canvas.clientWidth = 70; canvas.width = Math.round(70 * rx);
+            canvas.clientHeight = 40; canvas.height = Math.round(40 * ry);
+            renderer.draw(canvas, new GridMap(), view, next);
+            assert.ok(rectangles.length < 1000);
+            assert.deepEqual(paint(rectangles, rx, ry), paint(full, rx, ry));
+        }
     }
     loader.reset();
 });

@@ -1,6 +1,7 @@
 // canvas_renderer.ts
 import { Loader, DataView } from "./loader";
 import { RectRendererSoft, RectRendererWebGL } from "./rect_renderer";
+import { yieldToUI } from "./axis_index";
 
 /**
  * Context holding canvas rendering state and loaded data
@@ -53,6 +54,7 @@ class CanvasRenderer {
     private rowCache_: { view: DataView; context: RendererContext; pixelRatio: PixelScale; rows: Uint32Array } | null = null;
     private pendingRows_: { view: DataView; context: RendererContext; pixelRatio: PixelScale } | null = null;
     private rowGeneration_ = 0;
+    private pixelRows_: Uint32Array | null = null;
 
     private sameViewport(a: RendererContext, b: RendererContext): boolean {
         return a.width === b.width && a.height === b.height && a.offsetX === b.offsetX && a.offsetY === b.offsetY &&
@@ -64,6 +66,7 @@ class CanvasRenderer {
         this.rowGeneration_++;
         this.pendingRows_ = null;
         this.rowCache_ = null;
+        this.pixelRows_ = null;
     }
 
     private *selectRows(view: DataView, context: RendererContext, pixelRatio: PixelScale, selection: ReturnType<DataView["getVisibleRows"]>): Generator<void, Uint32Array> {
@@ -75,6 +78,15 @@ class CanvasRenderer {
         // 同じ画素範囲へ重なる点は、元の入力順で最後の行を残す。
         const aggregate = !(this.rectRenderer instanceof RectRendererSoft) && selection.end - selection.start > 100000 &&
             xBase * xBase * yBase * yBase < Number.MAX_SAFE_INTEGER;
+        const gridSlots = pixelWidth * pixelHeight * 4;
+        let pixelRows: Uint32Array | null = null;
+        // 縮小表示の1〜2画素の点はハッシュを使わず、画素と縦横の被覆サイズで直接引く。
+        // 作業配列はviewport間で再利用し、高解像度では32MiBを超えたらMapへ戻る。
+        if (aggregate && pointWidth * pixelRatio.x <= 2 && pointHeight * pixelRatio.y <= 2 && gridSlots * 4 <= 32 * 1024 * 1024) {
+            if (!this.pixelRows_ || this.pixelRows_.length < gridSlots) this.pixelRows_ = new Uint32Array(gridSlots);
+            pixelRows = this.pixelRows_.subarray(0, gridSlots);
+            pixelRows.fill(0);
+        }
         const pixels = aggregate ? new Map<number, number>() : null;
         const rows: number[] = [];
         for (let position = selection.start; position < selection.end; position++) {
@@ -90,14 +102,22 @@ class CanvasRenderer {
                 const y0 = Math.max(0, Math.ceil(y * pixelRatio.y - 0.5));
                 const y1 = Math.min(pixelHeight, Math.ceil((y + pointHeight) * pixelRatio.y - 0.5));
                 if (x0 >= x1 || y0 >= y1) continue;
+                const dx = x1 - x0, dy = y1 - y0;
+                if (pixelRows && dx <= 2 && dy <= 2) {
+                    const key = (y0 * pixelWidth + x0) * 4 + (dx - 1) * 2 + dy - 1;
+                    if (row + 1 > pixelRows[key]) pixelRows[key] = row + 1;
+                    continue;
+                }
                 const key = ((y0 * xBase + x0) * yBase + y1) * xBase + x1;
                 const previous = pixels.get(key);
                 if (previous === undefined || row > previous) pixels.set(key, row);
             } else rows.push(row);
         }
-        const result = Uint32Array.from(pixels ? pixels.values() : rows);
+        if (pixels) for (const row of pixels.values()) rows.push(row);
+        if (pixelRows) for (let pixel = 0; pixel < pixelRows.length; pixel++) if (pixelRows[pixel]) rows.push(pixelRows[pixel] - 1);
+        const result = Uint32Array.from(rows);
         // 索引の値順ではなく元の行順で描き、重なりの色を変えない。
-        result.sort();
+        if (aggregate || selection.order) result.sort();
         return result;
     }
 
@@ -126,9 +146,9 @@ class CanvasRenderer {
                     this.rowCache_ = { view, context, pixelRatio, rows: next.value };
                     this.pendingRows_ = null;
                     requestDraw();
-                } else setTimeout(advance, 0);
+                } else void yieldToUI().then(advance);
             };
-            setTimeout(advance, 0);
+            void yieldToUI().then(advance);
             return null;
         }
         let next;

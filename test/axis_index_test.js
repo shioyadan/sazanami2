@@ -128,6 +128,32 @@ test("Sorted axes use the existing row order without allocating an index", async
     assert.equal(cache.memoryBytes, 0);
 });
 
+test("Integer indexes preserve signed values and stable ties within the working budget", async () => {
+    const rows = 65537;
+    const buffer = Int32Array.from({ length: rows }, (_, i) => i % 17 === 0 ? -2147483648 : i % 31 === 0 ? 2147483647 : i * 1234567);
+    const x = { buffer, stat: { deviationFromMax: Infinity }, getNumber(i) { return buffer[i]; } };
+    const y = { ...x, buffer: Int32Array.from(buffer, value => ~value), getNumber(i) { return this.buffer[i]; } };
+    const cache = new AxisIndexCache(rows * 12 + 4096);
+    let ticks = 0, peak = 0;
+    const timer = setInterval(() => { ticks++; peak = Math.max(peak, cache.memoryBytes); }, 1);
+    try {
+        cache.prepare([x, y], rows, () => {});
+        await cache.waitForIdle();
+        assert.ok(ticks > 0);
+        assert.ok(peak <= cache.budgetBytes);
+        assert.equal(cache.memoryBytes, rows * 8);
+        for (const col of [x, y]) {
+            const expected = Array.from({ length: rows }, (_, row) => row).sort((a, b) => col.getNumber(a) - col.getNumber(b) || a - b);
+            assert.deepEqual(Array.from(cache.get(col)), expected);
+        }
+    } finally { clearInterval(timer); cache.clear(); }
+    const tiny = new AxisIndexCache(rows * 8 + 4095);
+    tiny.prepare([x], rows, () => { throw new Error("The histogram must fit in the budget"); });
+    await tiny.waitForIdle();
+    assert.equal(tiny.get(x), undefined);
+    assert.equal(tiny.progress, null);
+});
+
 test("Indexed viewport queries match a full scan before and after swapping axes", async () => {
     const loader = new Loader(), rows = 20000;
     const reader = { load(line, done) {

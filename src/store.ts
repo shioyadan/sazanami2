@@ -119,7 +119,7 @@ class Store {
             // 新規ファイル読み込み時は ViewDefinition をリセット
             this.patchState({ viewDef: INITIAL_VIEW_DEFINITION });
             this.trigger(CHANGE.FILE_LOADING_START);
-
+            let lastPreview = performance.now();
             this.loader.load(
                 fileLineReader,
                 (lines: number, elapsedMs: number) => {
@@ -153,9 +153,12 @@ class Store {
                     // 進捗
                     this.trigger(CHANGE.FILE_LOAD_PROGRESS, percent);
                     this.trigger(CHANGE.SHOW_MESSAGE_IN_STATUS_BAR, `${Math.floor(percent * 100)}% Loaded`);
-                    this.trigger(ACTION.UPDATE_RENDERER_CONTEXT, 
-                        { ...this.state_.renderCtx, numRows: this.loader.numRows });
-                    this.trigger(CHANGE.CONTENT_UPDATED);
+                    // 進捗バーは毎回更新し、大容量入力のCanvasプレビューの作り直しを抑える。
+                    if (performance.now() - lastPreview >= 500) {
+                        lastPreview = performance.now();
+                        this.trigger(ACTION.UPDATE_RENDERER_CONTEXT,
+                            { ...this.state_.renderCtx, numRows: this.loader.numRows });
+                    }
                 },
                 (err) => {
                     console.error(`Error loading file: ${err}`);

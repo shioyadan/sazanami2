@@ -49,6 +49,7 @@ export interface ColumnInterface {
     getString(index: number): string;
     stat: { min: number; max: number, deviationFromMax: number };
     codeToValueList: (string | number)[] | null;
+    readonly buffer?: Int32Array;
 }
 
 // 動的に拡張可能なバッファ
@@ -270,10 +271,7 @@ class Loader {
                     this.finalizeTypes_();
                 }
             } else {
-                values.forEach((raw, index) => {
-                    const val = raw ?? "";
-                    this.pushValue(index, val, false);
-                });
+                for (let index = 0; index < values.length; index++) this.pushValue(index, values[index], false);
             }
 
             this.numRows_++;
@@ -304,6 +302,11 @@ class Loader {
     }
 
     private finalizeTypes_(): void {
+        // 非圧縮入力の行数を見積もり、終盤の巨大な全列コピーを避ける。
+        // 推定が大きい入力は既存の拡張へ戻し、先行確保だけで256MiBを超えない。
+        const estimatedRows = this.reader_?.getRowCountEstimate?.();
+        const capacity = estimatedRows ? Math.ceil(estimatedRows * 1.05) : 0;
+        const reserve = capacity * this.headers_.length * Int32Array.BYTES_PER_ELEMENT <= 256 * 1024 * 1024;
         this.headers_.forEach((header, index) => {
             let isCode = false;
 
@@ -327,6 +330,9 @@ class Loader {
 
             if (isCode) {
                 this.columnsArr_[index].codeToValueList = [];
+            }
+            if (reserve && capacity > this.columnsArr_[index].buffer.length && (isCode || type !== columnString)) {
+                this.columnsArr_[index].buffer = new Int32Array(capacity);
             }
 
             // rawBufferからデータをバッファへ反映
@@ -368,18 +374,21 @@ class Loader {
     private pushBufferValue_(index: number, raw: string): void {
         const col = this.columnsArr_[index];
         let num = col.type === columnHex ? parseInt(raw, 16) : parseInt(raw, 10);
-        // Int32 範囲を超えた場合は元の文字列が表す値の下位 32bit を使用
+        // 正値は31bit、負値は符号付き32bitへ折りたたむ既存の格納規則を保つ。
         if (num < Loader.INT32_MIN_ || num > Loader.INT32_MAX_) {
-            // BigInt を使って元の値の下位 32bit を取得
-            // BigInt には parseInt が無いので，文字列から直接変換
-            const bigRaw = col.type === columnHex
-                ? (raw.startsWith("0x") || raw.startsWith("0X") ? raw : `0x${raw}`)
-                : raw;
-            const masked = 
-                num > Loader.INT32_MAX_ ? 
-                BigInt.asUintN(31, BigInt(bigRaw)) :   
-                BigInt.asIntN(32, BigInt(bigRaw));
-            num = Number(masked);
+            const validInteger = col.type === columnHex ? /^(?:0[xX])?[0-9a-fA-F]+$/.test(raw) : /^\s*[+-]?\d+\s*$/.test(raw);
+            if (Number.isSafeInteger(num) && validInteger) {
+                num = num > Loader.INT32_MAX_ ? num & 0x7fffffff : num | 0;
+            } else {
+                // Numberで正確に表せない場合だけ、元の文字列から下位bitを取得する。
+                const bigRaw = col.type === columnHex
+                    ? (raw.startsWith("0x") || raw.startsWith("0X") ? raw : `0x${raw}`)
+                    : raw;
+                const masked = num > Loader.INT32_MAX_
+                    ? BigInt.asUintN(31, BigInt(bigRaw))
+                    : BigInt.asIntN(32, BigInt(bigRaw));
+                num = Number(masked);
+            }
         }
         if (col.length >= col.buffer.length) {
             this.resizeBuffer_(index);

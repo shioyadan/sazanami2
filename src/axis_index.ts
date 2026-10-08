@@ -1,8 +1,75 @@
 import type { ColumnInterface } from "./loader";
 
+// 読み込み・索引生成・表示準備で共有し、連続setTimeoutの最低待機時間を避ける。
+const channel = typeof window !== "undefined" && typeof MessageChannel !== "undefined" ? new MessageChannel() : null;
+const pending: Array<() => void> = [];
+if (channel) channel.port1.onmessage = () => pending.shift()?.();
+
+export function yieldToUI(): Promise<void> {
+    if (!channel) return new Promise(resolve => setTimeout(resolve, 0));
+    return new Promise(resolve => {
+        pending.push(resolve);
+        channel.port2.postMessage(null);
+    });
+}
+
 export const AXIS_INDEX_BUDGET = 128 * 1024 * 1024;
 const RUN_SIZE = 8192;
-const yieldToUI = () => new Promise<void>(resolve => setTimeout(resolve, 0));
+const RADIX_HISTOGRAM_BYTES = 1024 * Uint32Array.BYTES_PER_ELEMENT;
+
+function canRadixSort(column: ColumnInterface, rows: number): boolean {
+    return column.buffer instanceof Int32Array && column.buffer.length >= rows && rows >= RUN_SIZE * 8;
+}
+
+// 整数列は比較を繰り返さず、各byteの計数と安定な振り分けで行番号を並べる。
+async function buildIntegerIndex(column: ColumnInterface, rows: number, cancelled: () => boolean, reusable: Uint32Array | null, onProgress: (progress: number) => void): Promise<{ order: Uint32Array; scratch: Uint32Array } | null> {
+    const values = column.buffer!;
+    const histogram = new Uint32Array(1024);
+    let order = reusable ?? new Uint32Array(rows), scratch = new Uint32Array(rows);
+    let deadline = performance.now() + 6;
+    for (let row = 0; row < rows; row++) {
+        const value = values[row];
+        histogram[value & 255]++;
+        histogram[256 + ((value >>> 8) & 255)]++;
+        histogram[512 + ((value >>> 16) & 255)]++;
+        histogram[768 + ((value >>> 24) ^ 128)]++;
+        if ((row & 8191) === 0 && performance.now() >= deadline) {
+            onProgress((row + 1) / (rows * 5));
+            await yieldToUI();
+            if (cancelled()) return null;
+            deadline = performance.now() + 6;
+        }
+    }
+    onProgress(0.2);
+    await yieldToUI();
+    if (cancelled()) return null;
+    for (let pass = 0; pass < 4; pass++) {
+        const base = pass * 256, shift = pass * 8, sign = pass === 3 ? 128 : 0;
+        let start = 0;
+        for (let bucket = 0; bucket < 256; bucket++) {
+            const count = histogram[base + bucket];
+            histogram[base + bucket] = start;
+            start += count;
+        }
+        deadline = performance.now() + 6;
+        for (let position = 0; position < rows; position++) {
+            const row = pass === 0 ? position : order[position];
+            const bucket = ((values[row] >>> shift) & 255) ^ sign;
+            scratch[histogram[base + bucket]++] = row;
+            if ((position & 8191) === 0 && performance.now() >= deadline) {
+                onProgress((pass + 1 + (position + 1) / rows) / 5);
+                await yieldToUI();
+                if (cancelled()) return null;
+                deadline = performance.now() + 6;
+            }
+        }
+        [order, scratch] = [scratch, order];
+        onProgress((pass + 2) / 5);
+        await yieldToUI();
+        if (cancelled()) return null;
+    }
+    return { order, scratch };
+}
 
 function sortableValue(column: ColumnInterface, row: number): number {
     const value = column.getNumber(row);
@@ -11,6 +78,7 @@ function sortableValue(column: ColumnInterface, row: number): number {
 
 // 元の列を参照したまま行番号だけを並べる。大きな値配列の複製は作らない。
 async function buildIndex(column: ColumnInterface, rows: number, cancelled: () => boolean, reusable: Uint32Array | null, onProgress: (progress: number) => void): Promise<{ order: Uint32Array; scratch: Uint32Array } | null> {
+    if (canRadixSort(column, rows)) return buildIntegerIndex(column, rows, cancelled, reusable, onProgress);
     let order = reusable ?? new Uint32Array(rows), scratch = new Uint32Array(rows);
     const passes = 1 + Math.max(0, Math.ceil(Math.log2(rows / RUN_SIZE)));
     let completedPasses = 0;
@@ -108,7 +176,8 @@ export class AxisIndexCache {
         let retainedBytes = this.memoryBytes - this.workingBytes;
         if (rows > 0 && rows <= 0xffffffff) {
             for (const column of selected) {
-                if (this.entries.has(column) || retainedBytes + indexBytes * 2 > this.budgetBytes) continue;
+                const histogramBytes = canRadixSort(column, rows) ? RADIX_HISTOGRAM_BYTES : 0;
+                if (this.entries.has(column) || retainedBytes + indexBytes * 2 + histogramBytes > this.budgetBytes) continue;
                 toBuild.push(column);
                 retainedBytes += indexBytes;
             }
@@ -123,7 +192,7 @@ export class AxisIndexCache {
             try {
                 for (const column of toBuild) {
                     if (generation !== this.generation) return;
-                    this.workingBytes = indexBytes * 2;
+                    this.workingBytes = indexBytes * 2 + (canRadixSort(column, rows) ? RADIX_HISTOGRAM_BYTES : 0);
                     let result: Awaited<ReturnType<typeof buildIndex>> = null;
                     try {
                         result = await buildIndex(column, rows, () => generation !== this.generation, reusable, progress => {

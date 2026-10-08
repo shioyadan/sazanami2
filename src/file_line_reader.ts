@@ -1,4 +1,5 @@
 import getFZSTD_Reader from "./zstd_reader"
+import { yieldToUI } from "./axis_index";
 
 export interface FileLineReaderOptions {
     file?: File;
@@ -13,7 +14,9 @@ export class FileLineReader {
     private decoder_ = new TextDecoder('utf-8');
     private buffer_ = '';
     private bytesRead_ = 0; // 読み取ったバイト数
-    private numLine_ = 0;
+    private decodedChars_ = 0;
+    private processedChars_ = 0;
+    private numLines_ = 0;
     private initialized_ = false;
     private isZstd_ = false;
     private canceled_ = false;
@@ -51,6 +54,12 @@ export class FileLineReader {
         return Math.min(1, this.bytesRead_ / total);
     }
 
+    getRowCountEstimate(): number | null {
+        if (this.isZstd_ || !this.fileSize_ || !this.processedChars_) return null;
+        const fraction = this.processedChars_ / this.decodedChars_ * this.bytesRead_ / this.fileSize_;
+        return fraction > 0 ? Math.ceil(this.numLines_ / fraction) : null;
+    }
+
     /** 初期化：拡張子で判定し、必要なら zstd 伸長ストリームを用意（pull 駆動） */
     private async init_(): Promise<void> {
         if (this.initialized_) return;
@@ -79,55 +88,6 @@ export class FileLineReader {
     }
 
 
-    /** 次の行を読み込む。トレイリング改行なし。EOF で null。 */
-    private async readLine_(): Promise<string | null> {
-
-        this.numLine_++;
-        if (this.numLine_ % 50000 === 0) {
-            // UI の更新を待つために一瞬スリープをいれる
-            await new Promise(r => setTimeout(r, 0)); 
-            if (this.canceled_) return null;
-        }
-
-        // まず内部バッファを確認
-        let newlineIndex = this.buffer_.indexOf('\n');
-        if (newlineIndex !== -1) {
-            const line = this.buffer_.slice(0, newlineIndex);
-            this.buffer_ = this.buffer_.slice(newlineIndex + 1);
-            return line;
-        }
-
-        // 追加読み込み（必要になった分だけ pull で進む）
-        while (true) {
-            const { done, value } = await this.reader_.read();
-            if (done) {
-                // 終端で進捗を 100%
-                this.bytesRead_ = this.fileSize_;
-                if (this.buffer_.length > 0) {
-                    const line = this.buffer_;
-                    this.buffer_ = '';
-                    return line;
-                }
-                return null;
-            }
-
-            if (value) {
-                this.buffer_ += this.decoder_.decode(value, { stream: true });
-                // 非 zstd のときだけ、生バイトをここで進捗加算
-                if (!this.isZstd_) {
-                    this.bytesRead_ += value.byteLength;
-                }
-            }
-
-            newlineIndex = this.buffer_.indexOf('\n');
-            if (newlineIndex !== -1) {
-                const line = this.buffer_.slice(0, newlineIndex);
-                this.buffer_ = this.buffer_.slice(newlineIndex + 1);
-                return line;
-            }
-        }
-    }
-
     /** コールバックを受け取り、1行読み込むたびに onLineRead を呼ぶ。 */
     async load(
         onLineRead: (line: string) => void,
@@ -136,23 +96,55 @@ export class FileLineReader {
     ): Promise<void> {
         try {
             await this.init_();
+            if (this.canceled_) { await this.reader_.cancel(); return; }
+            let lines = 0, deadline = performance.now() + 6;
+            while (!this.canceled_) {
+                const { done, value } = await this.reader_.read();
+                if (this.canceled_) return;
+                if (done) break;
+                const decoded = this.decoder_.decode(value, { stream: true });
+                this.decodedChars_ += decoded.length;
+                this.buffer_ += decoded;
+                if (!this.isZstd_) this.bytesRead_ += value.byteLength;
 
-            let line: string | null;
-            while ((line = await this.readLine_()) !== null) {
-                onLineRead(line);
+                // 行ごとのPromiseと残り文字列の切り出しを避け、受信chunk内をまとめて処理する。
+                let start = 0, end: number;
+                while ((end = this.buffer_.indexOf('\n', start)) !== -1) {
+                    this.processedChars_ += end - start + 1;
+                    this.numLines_++;
+                    onLineRead(this.buffer_.slice(start, end));
+                    if (this.canceled_) return;
+                    start = end + 1;
+                    if ((++lines & 1023) === 0 && performance.now() >= deadline) {
+                        await yieldToUI();
+                        if (this.canceled_) return;
+                        deadline = performance.now() + 6;
+                    }
+                }
+                this.buffer_ = this.buffer_.slice(start);
             }
-            if (this.canceled_) 
-                return;
+            if (this.canceled_) return;
+            const tail = this.decoder_.decode();
+            this.decodedChars_ += tail.length;
+            this.buffer_ += tail;
+            if (this.buffer_.length) {
+                this.processedChars_ += this.buffer_.length;
+                this.numLines_++;
+                onLineRead(this.buffer_);
+            }
+            if (this.canceled_) return;
+            this.buffer_ = '';
+            this.bytesRead_ = this.fileSize_;
             finishCallback();
         } catch (e) {
-            errorCallback(e);
+            if (!this.canceled_) errorCallback(e);
         }
     }
 
     cancel() {
+        this.canceled_ = true;
         if (this.reader_) {
             this.reader_.cancel();
-            this.canceled_ = true;
         }
     }
 }
