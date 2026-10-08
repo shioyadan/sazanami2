@@ -401,6 +401,13 @@ export class DataView {
 
     prepareIndexes(): void { this.loaderRef_.prepareIndexes([this.xCol_, this.yCol_]); }
 
+    getAxisColumns(): readonly [ColumnInterface, ColumnInterface] { return [this.xCol_, this.yCol_]; }
+
+    getOverviewIndex() {
+        const index = this.loaderRef_.axisIndexes.getOverview([this.xCol_, this.yCol_]);
+        return index ? { index, swapped: index.columns[0] !== this.xCol_ } : null;
+    }
+
     getVisibleRows(xMin: number, yMin: number, xMax: number, yMax: number): { order: Uint32Array | null; start: number; end: number } {
         let selection: { order: Uint32Array | null; start: number; end: number } = {
             order: null, start: this.getStartIdx(xMin, yMin), end: this.getEndIdx(xMax, yMax) + 1

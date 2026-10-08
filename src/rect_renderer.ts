@@ -9,7 +9,7 @@ class RectRendererWebGL {
     private imageHeightCSS_: number = 0;
     private imageWidthCSS_: number = 0;
 
-    // 2D は合成にのみ使用
+    // 2D は合成と細い点の画素描画に使用
     private ctx2d_: CanvasRenderingContext2D | null = null;
 
     // CSS→DOM 変換用スケール
@@ -38,6 +38,9 @@ class RectRendererWebGL {
 
     // バッチ用ワーク
     private rawMode_: boolean = false;
+    private rasterMode_: boolean = false;
+    private rasterImage_: ImageData | null = null;
+    private rasterPixels_: Uint32Array | null = null;
     private cap_: number = 0;
     private count_: number = 0;
     private pos_: Float32Array = new Float32Array(0);
@@ -66,6 +69,24 @@ class RectRendererWebGL {
     get clientWidth(): number { return this.ctx2d_?.canvas.clientWidth ?? 0; }
     get clientHeight(): number { return this.ctx2d_?.canvas.clientHeight ?? 0; }
 
+    // 不透明な細い点は画素へ直接描き、GL描画後のCanvas間転送を避ける。
+    // 適用条件と画像サイズの上限はCanvasRendererが判定する。
+    beginRasterMode(canvas: HTMLCanvasElement, background: number): void {
+        const ctx = canvas.getContext("2d");
+        if (!ctx) throw new Error("2D rendering context could not be obtained.");
+        this.ctx2d_ = ctx;
+        this.imageWidthDOM_ = canvas.width; this.imageHeightDOM_ = canvas.height;
+        this.imageWidthScale_ = canvas.width / Math.max(1, canvas.clientWidth);
+        this.imageHeightScale_ = canvas.height / Math.max(1, canvas.clientHeight);
+        if (!this.rasterImage_ || this.rasterImage_.width !== canvas.width || this.rasterImage_.height !== canvas.height) {
+            this.rasterImage_ = ctx.createImageData(canvas.width, canvas.height);
+            this.rasterPixels_ = new Uint32Array(this.rasterImage_.data.buffer);
+        }
+        this.rasterPixels_!.fill(background);
+        this.rasterMode_ = true;
+        this.rawMode_ = true;
+    }
+
     // beginRawMode でキャンバスを受け取り、必要なら WebGL2 を初期化
     beginRawMode(canvas: HTMLCanvasElement, scale: number): void {
         // 2D を確保
@@ -93,6 +114,7 @@ class RectRendererWebGL {
         }
 
         // バッチ状態リセット
+        this.rasterMode_ = false;
         this.rawMode_ = true;
         this.count_ = 0;
 
@@ -114,6 +136,12 @@ class RectRendererWebGL {
 
     endRawMode(): void {
         if (!this.rawMode_) return;
+        if (this.rasterMode_) {
+            this.ctx2d_!.putImageData(this.rasterImage_!, 0, 0);
+            this.rasterMode_ = false;
+            this.rawMode_ = false;
+            return;
+        }
         this.flush_();
 
         // メイン 2D へピクセル等倍で合成
@@ -130,6 +158,16 @@ class RectRendererWebGL {
 
     // 多数呼ばれる：raw 中は GPU バッチに積む。非 raw は 2D 即時描画。
     fillRect(cssLeft: number, cssTop: number, cssWidth: number, cssHeight: number, packed: number): void {
+        if (this.rasterMode_) {
+            // 画素中心が矩形内にある範囲を使い、表示準備の被覆判定と揃える。
+            const x0 = Math.max(0, Math.ceil(cssLeft * this.imageWidthScale_ - 0.5));
+            const x1 = Math.min(this.imageWidthDOM_, Math.ceil((cssLeft + cssWidth) * this.imageWidthScale_ - 0.5));
+            const y0 = Math.max(0, Math.ceil(cssTop * this.imageHeightScale_ - 0.5));
+            const y1 = Math.min(this.imageHeightDOM_, Math.ceil((cssTop + cssHeight) * this.imageHeightScale_ - 0.5));
+            if (x0 >= x1) return;
+            for (let y = y0; y < y1; y++) this.rasterPixels_!.fill(packed, y * this.imageWidthDOM_ + x0, y * this.imageWidthDOM_ + x1);
+            return;
+        }
         if (this.rawMode_) {
             this.queueRectPacked_(cssLeft, cssTop, cssWidth, cssHeight, packed);
             return;
@@ -145,37 +183,25 @@ class RectRendererWebGL {
     }
 
     private queueRectPacked_(cssLeft: number, cssTop: number, cssWidth: number, cssHeight: number, packedRGBA: number): void {
-        // CSS→DOM 変換とクランプ（元ロジックと統一）
+        // 画素中心で被覆を確定してからGPUへ渡す。元の小数座標を渡すと、
+        // GPUのsubpixel精度によって半画素付近の点が隣の行へ移り、集約時の判定とずれる。
         const sx = this.imageWidthScale_;
         const sy = this.imageHeightScale_;
         const wDOM = this.imageWidthDOM_;
         const hDOM = this.imageHeightDOM_;
 
-        let left   = cssLeft * sx;
-        let top    = cssTop * sy;
-        let right  = (cssLeft + cssWidth) * sx;
-        let bottom = (cssTop  + cssHeight) * sy;
-
-        left   = Math.max(0, left);
-        top    = Math.max(0, top);
-        right  = Math.max(left,  Math.min(right,  wDOM));
-        bottom = Math.max(top,   Math.min(bottom, hDOM));
-
-        const x0 = left;
-        const y0 = top;
-        const x1 = right;
-        const y1 = bottom;
+        const x0 = Math.max(0, Math.ceil(cssLeft * sx - 0.5));
+        const y0 = Math.max(0, Math.ceil(cssTop * sy - 0.5));
+        const x1 = Math.min(wDOM, Math.ceil((cssLeft + cssWidth) * sx - 0.5));
+        const y1 = Math.min(hDOM, Math.ceil((cssTop + cssHeight) * sy - 0.5));
         if (x1 <= x0 || y1 <= y0) return;
-
-        let w = Math.max(x1 - x0, 0.5);
-        let h = Math.max(y1 - y0, 0.5);
 
         if (this.count_ >= this.cap_) this.grow_();
         const i2 = this.count_ * 2;
         this.pos_[i2 + 0] = x0;
         this.pos_[i2 + 1] = y0;
-        this.size_[i2 + 0] = w;
-        this.size_[i2 + 1] = h;
+        this.size_[i2 + 0] = x1 - x0;
+        this.size_[i2 + 1] = y1 - y0;
 
         this.color_[this.count_] = packedRGBA;
         this.count_++;

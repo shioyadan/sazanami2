@@ -14,6 +14,7 @@ require.extensions[".ts"] = (module, filename) => {
 const { Loader } = require("../src/loader.ts");
 const { inferViewDefinition } = require("../src/data_view.ts");
 const { CanvasRenderer, GridMap, INITIAL_RENDERER_CONTEXT } = require("../src/canvas_renderer.ts");
+const { RectRendererWebGL } = require("../src/rect_renderer.ts");
 
 function load(csv, definition) {
     const loader = new Loader();
@@ -232,6 +233,109 @@ test("Pixel aggregation preserves the final color of overlapping rectangles", ()
     loader.reset();
 });
 
+test("Overview traversal preserves boundary rows, colors and swapped or fractional axes", async () => {
+    const n = 160003, csv = "x,y,color\n" + Array.from({ length: n }, (_, i) => `${i % 17},${Math.floor(i / 17) % 19},${i % 3}`).join("\n");
+    const original = { view: { axisXField: "x", axisYField: "y", colorField: "color" }, columns: {} };
+    const { loader } = load(csv, original), { renderer, canvas } = makeRenderer();
+    for (const definition of [original, { ...original, view: { ...original.view, axisXField: "y", axisYField: "x" } }, {
+        view: { axisXField: "fractional", axisYField: "y", colorField: "color" }, columns: { fractional: "-x / 8" }
+    }, {
+        view: { axisXField: "x", axisYField: "time", colorField: "color" }, columns: { time: "y * 101" }
+    }, {
+        view: { axisXField: "time", axisYField: "x", colorField: "color" }, columns: { time: "y * 101" }
+    }]) {
+        const view = loader.GetDataView(definition);
+        await loader.axisIndexes.waitForIdle();
+        assert.ok(view.getOverviewIndex());
+        for (const ratio of [1, 1.25]) {
+            canvas.clientWidth = 70; canvas.width = Math.round(70 * ratio);
+            canvas.clientHeight = 40; canvas.height = Math.round(40 * ratio);
+            for (const [scale, offset, point] of [[0.0001, -0.25, 1], [0.7, 0.25, 1], [0.7, 0.25, 3]]) {
+                const context = { ...INITIAL_RENDERER_CONTEXT, width: 70, height: 40,
+                    scaleXLog: Math.log(scale), scaleYLog: Math.log(scale), offsetX: offset, offsetY: offset,
+                    minPlotWidth: point, minPlotHeight: point };
+                renderer.cancelPendingRows();
+                renderer.draw(canvas, new GridMap(), view, context);
+                const indexed = renderer.rowCache_.rows;
+                const overview = view.getOverviewIndex;
+                view.getOverviewIndex = () => null;
+                try {
+                    renderer.cancelPendingRows();
+                    renderer.draw(canvas, new GridMap(), view, context);
+                    assert.deepEqual(indexed, renderer.rowCache_.rows);
+                } finally { view.getOverviewIndex = overview; }
+            }
+        }
+    }
+    const view = loader.GetDataView(original);
+    await loader.axisIndexes.waitForIdle();
+    let reads = 0;
+    const getX = view.getX.bind(view);
+    view.getX = row => { reads++; return getX(row); };
+    renderer.cancelPendingRows();
+    renderer.draw(canvas, new GridMap(), view, { ...INITIAL_RENDERER_CONTEXT, width: 70, height: 40,
+        scaleXLog: Math.log(0.0001), scaleYLog: Math.log(0.0001), offsetX: -0.25, offsetY: -0.25 });
+    assert.deepEqual(Array.from(renderer.rowCache_.rows), [n - 1]);
+    assert.ok(reads < 50, "A collapsed overview must avoid reading all source coordinates");
+    loader.reset();
+});
+
+test("Fit projection tables preserve signed coordinates, clipping and fractional pixel ratios", () => {
+    const n = 120003, csv = "x,y,color\n" + Array.from({ length: n }, (_, i) =>
+        `${i === 0 ? -2147483648 : i === 1 ? 2147483647 : (i * 7919) % 10000019},${i === 0 ? -2147483648 : i === 1 ? 2147483647 : (i * 8191) % 10000079},${i % 3}`
+    ).join("\n");
+    const { loader, view } = load(csv, { view: { axisXField: "x", axisYField: "y", colorField: "color" }, columns: {} });
+    const { renderer, canvas } = makeRenderer(), columns = view.getAxisColumns.bind(view);
+    assert.equal(view.getOverviewIndex(), null, "The lookup must also work before asynchronous indexes finish");
+    let previousTables;
+    for (const ratio of [1, 1.25, 2]) {
+        canvas.clientWidth = 690; canvas.width = Math.round(690 * ratio);
+        canvas.clientHeight = 340; canvas.height = Math.round(340 * ratio);
+        const fit = renderer.fitScaleToData(view, { ...INITIAL_RENDERER_CONTEXT, width: 690, height: 340 });
+        for (const [offset, point] of [[0, 1], [0.25, 1], [-0.75, 3]]) {
+            const context = { ...fit, offsetX: fit.offsetX + offset, offsetY: fit.offsetY - offset, minPlotWidth: point, minPlotHeight: point };
+            renderer.rowCache_ = null;
+            renderer.fitRows_ = null;
+            renderer.draw(canvas, new GridMap(), view, context);
+            const actual = renderer.rowCache_.rows;
+            assert.equal(renderer.projectionTables_.length, 2);
+            assert.ok(renderer.projectionTables_.reduce((sum, table) => sum + table.byteLength, 0) <= 512 * 1024);
+            if (previousTables) assert.ok(renderer.projectionTables_.every((table, i) => table === previousTables[i]));
+            previousTables = renderer.projectionTables_.slice();
+            view.getAxisColumns = () => columns().map(column => ({ ...column, buffer: undefined }));
+            try {
+                renderer.rowCache_ = null;
+                renderer.fitRows_ = null;
+                renderer.draw(canvas, new GridMap(), view, context);
+                assert.deepEqual(actual, renderer.rowCache_.rows);
+            } finally { view.getAxisColumns = columns; }
+        }
+    }
+    loader.reset();
+});
+
+test("Returning to Fit reuses the overview and cancels a pending zoom", () => {
+    const n = 120003, csv = "x,y\n" + Array.from({ length: n }, (_, i) => `${i % 101},${i % 103}`).join("\n");
+    const { loader, view } = load(csv, { view: { axisXField: "x", axisYField: "y" }, columns: {} });
+    const { renderer, canvas } = makeRenderer(), grid = new GridMap();
+    const fit = renderer.fitScaleToData(view, { ...INITIAL_RENDERER_CONTEXT, width: 690, height: 340 });
+    renderer.draw(canvas, grid, view, fit);
+    const prepared = renderer.rowCache_;
+    assert.equal(renderer.fitRows_, prepared);
+    assert.ok(prepared.rows.byteLength <= 2 * 1024 * 1024);
+    renderer.draw(canvas, grid, view, { ...fit, offsetX: fit.offsetX + 1 });
+    assert.notEqual(renderer.rowCache_, prepared);
+    renderer.draw(canvas, grid, view, { ...fit, offsetX: fit.offsetX + 2 }, () => { throw new Error("Cancelled zoom must not publish"); });
+    assert.ok(renderer.pendingRows_);
+    renderer.selectRows = () => { throw new Error("Returning to Fit must not prepare rows again"); };
+    renderer.draw(canvas, grid, view, fit);
+    assert.equal(renderer.rowCache_, prepared);
+    assert.equal(renderer.pendingRows_, null);
+    renderer.cancelPendingRows();
+    assert.equal(renderer.fitRows_, null);
+    loader.reset();
+});
+
 test("Large view preparation yields and discards a cancelled viewport", async () => {
     const n = 100001, csv = "cycle,unit\n" + Array.from({ length: n }, (_, i) => `${i},${i % 2}`).join("\n");
     const { loader, view } = load(csv);
@@ -260,5 +364,169 @@ test("Sorted axes restrict candidates to the intersection of their ranges", () =
     assert.deepEqual(view.getVisibleRows(1, 1, 3, 1), { order: null, start: 2, end: 4 });
     const disjoint = view.getVisibleRows(0, 2, 0, 3);
     assert.ok(disjoint.start >= disjoint.end);
+    loader.reset();
+});
+
+
+test("Refined integer indexes preserve fresh Fit-scale pans and fractional raster boundaries", async () => {
+    const n = 120003, csv = "x,y,color\n" + Array.from({ length: n }, (_, i) =>
+        `${i === n - 1 ? 11002192 : i * 7919 % 400000},${i === n - 1 ? 25000174 : i * 8191 % 700000},${i % 3}`
+    ).join("\n");
+    const { loader } = load(csv, { view: { axisXField: "x", axisYField: "y", colorField: "color" }, columns: {} });
+    const { renderer, canvas } = makeRenderer();
+    let refined = 0;
+    const select = renderer.selectRefinedRows;
+    renderer.selectRefinedRows = function*(...args) { refined++; yield* select.apply(this, args); };
+    for (const swapped of [false, true]) {
+        const view = loader.GetDataView({ view: { axisXField: swapped ? "y" : "x", axisYField: swapped ? "x" : "y", colorField: "color" }, columns: {} });
+        await loader.axisIndexes.waitForIdle();
+        assert.ok(view.getOverviewIndex().index.fine);
+        const fit = renderer.fitScaleToData(view, { ...INITIAL_RENDERER_CONTEXT, width: 690, height: 340 });
+        for (const ratio of [1, 1.25, 2]) {
+            canvas.clientWidth = 690; canvas.width = Math.round(690 * ratio);
+            canvas.clientHeight = 340; canvas.height = Math.round(340 * ratio);
+            for (const [offset, point] of [[0.37, 1], [-0.8, 1], [0.25, 3]]) {
+                const context = { ...fit, offsetX: fit.offsetX + offset, offsetY: fit.offsetY - offset, minPlotWidth: point, minPlotHeight: point };
+                renderer.cancelPendingRows();
+                renderer.draw(canvas, new GridMap(), view, context);
+                const actual = renderer.rowCache_.rows;
+                const getOverview = view.getOverviewIndex;
+                view.getOverviewIndex = () => null;
+                try {
+                    renderer.cancelPendingRows();
+                    renderer.draw(canvas, new GridMap(), view, context);
+                    assert.deepEqual(actual, renderer.rowCache_.rows);
+                } finally { view.getOverviewIndex = getOverview; }
+            }
+        }
+    }
+    assert.ok(refined > 0, "Fresh viewports must use sparse refinement without relying on the Fit cache");
+    loader.reset();
+});
+
+test("Exact interval queries preserve the last row across categories, swaps and pixel boundaries", async () => {
+    const n = 120003, csv = "category,time,color\n" + Array.from({ length: n }, (_, i) =>
+        `${i % 7 - 3},${i * 7919 % 60001 - 30000},${i % 3}`
+    ).join("\n");
+    const { loader } = load(csv, { view: { axisXField: "category", axisYField: "time", colorField: "color" }, columns: {} });
+    const { renderer, canvas } = makeRenderer();
+    for (const swapped of [false, true]) {
+        const view = loader.GetDataView({ view: { axisXField: swapped ? "time" : "category", axisYField: swapped ? "category" : "time", colorField: "color" }, columns: {} });
+        await loader.axisIndexes.waitForIdle();
+        assert.ok(renderer.exactOverview(view));
+        const fit = renderer.fitScaleToData(view, { ...INITIAL_RENDERER_CONTEXT, width: 690, height: 340 });
+        for (const ratio of [1, 1.25, 2]) {
+            canvas.clientWidth = 690; canvas.width = Math.round(690 * ratio);
+            canvas.clientHeight = 340; canvas.height = Math.round(340 * ratio);
+            for (const [zoom, offset, point] of [[1, 0.37, 1], [0.5, -0.8, 3], [0.0001, 0.25, 1], [3, 0.53, 1]]) {
+                const context = { ...fit, scaleXLog: fit.scaleXLog + Math.log(zoom), scaleYLog: fit.scaleYLog + Math.log(zoom),
+                    offsetX: fit.offsetX * zoom + offset, offsetY: fit.offsetY * zoom - offset, minPlotWidth: point, minPlotHeight: point };
+                renderer.cancelPendingRows();
+                renderer.draw(canvas, new GridMap(), view, context);
+                const actual = renderer.rowCache_.rows;
+                const getOverview = view.getOverviewIndex;
+                view.getOverviewIndex = () => null;
+                try {
+                    renderer.cancelPendingRows();
+                    renderer.draw(canvas, new GridMap(), view, context);
+                    assert.deepEqual(actual, renderer.rowCache_.rows);
+                } finally { view.getOverviewIndex = getOverview; }
+            }
+        }
+    }
+    loader.reset();
+});
+
+test("Fast indexed preparation draws in the input frame without another redraw request", async () => {
+    const n = 120003, csv = "category,time\n" + Array.from({ length: n }, (_, i) => `${i % 3},${i % 60001}`).join("\n");
+    const { loader, view } = load(csv, { view: { axisXField: "category", axisYField: "time" }, columns: {} });
+    await loader.axisIndexes.waitForIdle();
+    const { renderer, canvas, rectangles } = makeRenderer();
+    const fit = renderer.fitScaleToData(view, { ...INITIAL_RENDERER_CONTEXT, width: 100, height: 80 });
+    assert.ok(renderer.exactOverview(view));
+    let redraws = 0;
+    // 実行機の負荷に左右されず、最初のsliceの完了と時間切れの両方を確認する。
+    const clock = Object.getOwnPropertyDescriptor(globalThis, "performance");
+    let exhausted = false, elapsed = 0;
+    Object.defineProperty(globalThis, "performance", { configurable: true, value: { now: () => exhausted ? elapsed += 7 : 0 } });
+    try {
+        renderer.draw(canvas, new GridMap(), view, fit, () => redraws++);
+        assert.equal(renderer.pendingRows_, null);
+        assert.ok(rectangles.length > 0);
+        exhausted = true;
+        renderer.draw(canvas, new GridMap(), view, { ...fit, offsetX: fit.offsetX + 0.37 }, () => redraws++);
+        assert.ok(renderer.pendingRows_, "An exhausted initial slice must yield to the UI");
+        renderer.cancelPendingRows();
+    } finally { Object.defineProperty(globalThis, "performance", clock); }
+    await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal(redraws, 0);
+    loader.reset();
+});
+
+test("Direct raster and GPU batches agree on clipped, overlapping and half-pixel rectangles", () => {
+    const background = 0xff231e1c, red = 0xff0000ff, blue = 0xffff0000, green = 0xff00ff00;
+    let displayed;
+    const ctx = {
+        createImageData(width, height) { return { width, height, data: new Uint8ClampedArray(width * height * 4) }; },
+        putImageData(image, x, y) { assert.equal(x, 0); assert.equal(y, 0); displayed = image; }
+    };
+    const canvas = { width: 10, height: 6, clientWidth: 8, clientHeight: 3, getContext() { return ctx; } };
+    const rects = [
+        [0.4, 0.25, 1.6, 1, red], [1.2, 0.75, 1.6, 0.5, blue], [-2, -1, 2.8, 1.5, green],
+        [8, 0, 1, 1, red], [0, 3, 1, 1, red], [0, 0, 0.1, 0.1, red]
+    ];
+    const raster = new RectRendererWebGL();
+    raster.beginRasterMode(canvas, background);
+    for (const args of rects) raster.fillRect(...args);
+    raster.endRawMode();
+    const expected = new Uint32Array(60).fill(background);
+    expected[0] = green; expected[1] = red; expected[10] = red; expected[11] = blue; expected[12] = blue;
+    assert.deepEqual(new Uint32Array(displayed.data.buffer), expected);
+    const retained = displayed;
+    raster.beginRasterMode(canvas, background);
+    raster.endRawMode();
+    assert.equal(displayed, retained, "The image allocation must be reused");
+    assert.ok(new Uint32Array(displayed.data.buffer).every(color => color === background));
+
+    // WebGL contextを作らず、実際のGPUバッチ生成だけを検証する。
+    raster.rasterMode_ = false; raster.rawMode_ = true;
+    for (const args of rects) raster.fillRect(...args);
+    assert.equal(raster.count_, 3);
+    const gpuPixels = new Uint32Array(60).fill(background);
+    for (let i = 0; i < raster.count_; i++) {
+        const x0 = raster.pos_[i * 2], y0 = raster.pos_[i * 2 + 1];
+        const x1 = x0 + raster.size_[i * 2], y1 = y0 + raster.size_[i * 2 + 1];
+        for (let y = y0; y < y1; y++) gpuPixels.fill(raster.color_[i], y * 10 + x0, y * 10 + x1);
+    }
+    assert.deepEqual(gpuPixels, expected);
+});
+
+test("Direct raster is limited to small opaque indexed points and bounded image memory", async () => {
+    const n = 120003, csv = "category,time\n" + Array.from({ length: n }, (_, i) => `${i % 3},${i % 60001}`).join("\n");
+    const { loader, view } = load(csv, { view: { axisXField: "category", axisYField: "time" }, columns: {} });
+    await loader.axisIndexes.waitForIdle();
+    const { renderer, canvas } = makeRenderer(), gl = new RectRendererWebGL();
+    let raster = 0, batches = 0;
+    gl.beginRasterMode = () => raster++;
+    gl.beginRawMode = () => batches++;
+    gl.fillRect = () => {};
+    gl.endRawMode = () => {};
+    renderer.rectRenderer = gl;
+    canvas.clientWidth = canvas.width = 690;
+    canvas.clientHeight = canvas.height = 340;
+    const fit = renderer.fitScaleToData(view, { ...INITIAL_RENDERER_CONTEXT, width: 690, height: 340 });
+    renderer.draw(canvas, new GridMap(), view, fit);
+    assert.equal(raster, 1);
+    const palette = view.getPalette.bind(view);
+    view.getPalette = () => palette().map(color => (color & 0xffffff) | 0x80000000);
+    renderer.draw(canvas, new GridMap(), view, fit);
+    assert.equal(batches, 1, "Translucent points require blending");
+    view.getPalette = palette;
+    renderer.draw(canvas, new GridMap(), view, { ...fit, minPlotWidth: 3, minPlotHeight: 3 });
+    assert.equal(batches, 2, "Larger points must retain the GPU backend");
+    canvas.width = canvas.height = 4096;
+    renderer.draw(canvas, new GridMap(), view, fit);
+    assert.equal(batches, 3, "The raster image must stay within 16 MiB");
+    assert.equal(raster, 1);
     loader.reset();
 });

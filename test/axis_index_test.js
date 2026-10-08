@@ -154,6 +154,55 @@ test("Integer indexes preserve signed values and stable ties within the working 
     assert.equal(tiny.progress, null);
 });
 
+test("Overview levels retain all source rows within the shared index budget", async () => {
+    const rows = 100003;
+    const makeColumn = formula => {
+        const buffer = Int32Array.from({ length: rows }, (_, i) => formula(i));
+        return { buffer, stat: { min: 0, max: 126, deviationFromMax: 126 }, getNumber(i) { return buffer[i]; } };
+    };
+    const x = makeColumn(i => i % 127), y = makeColumn(i => Math.floor(i / 127) % 127);
+    const cache = new AxisIndexCache(rows * 12 + 100000);
+    let peak = 0;
+    cache.onProgress = () => { peak = Math.max(peak, cache.memoryBytes); };
+    cache.prepare([x, y], rows, () => {});
+    await cache.waitForIdle();
+    const index = cache.getOverview([x, y]);
+    assert.ok(index);
+    assert.ok(peak <= cache.budgetBytes && cache.memoryBytes <= cache.budgetBytes);
+    const seen = new Uint8Array(rows);
+    for (const head of index.levels[0].heads) {
+        for (let link = head; link; link = index.next[link - 1]) {
+            assert.equal(seen[link - 1]++, 0);
+            assert.ok(index.next[link - 1] < link);
+        }
+    }
+    assert.ok(seen.every(value => value === 1));
+    assert.equal(index.levels.at(-1).heads[0], rows);
+    assert.equal(cache.getOverview([x, x]), null);
+    cache.prepare([y, x], rows, () => { throw new Error("Swapped axes must reuse the overview"); });
+    await cache.waitForIdle();
+    assert.equal(cache.getOverview([y, x]), index);
+    cache.clear();
+    assert.equal(cache.getOverview([x, y]), null);
+    assert.equal(cache.memoryBytes, 0);
+});
+
+test("A replaced overview cannot publish stale data or progress", async () => {
+    const rows = 100003, buffer = Int32Array.from({ length: rows }, (_, i) => i);
+    const x = { buffer, stat: { min: 0, max: rows - 1, deviationFromMax: 0 }, getNumber(i) { return buffer[i]; } };
+    const y = { ...x }, replacement = { ...x };
+    const cache = new AxisIndexCache(rows * 12), ready = [];
+    cache.prepare([x, y], rows, () => ready.push("old"));
+    await new Promise(resolve => setTimeout(resolve, 1));
+    cache.prepare([x, replacement], rows, () => ready.push("new"));
+    await cache.waitForIdle();
+    assert.deepEqual(ready, ["new"]);
+    assert.equal(cache.getOverview([x, y]), null);
+    assert.ok(cache.getOverview([x, replacement]));
+    assert.equal(cache.progress, null);
+    cache.clear();
+});
+
 test("Indexed viewport queries match a full scan before and after swapping axes", async () => {
     const loader = new Loader(), rows = 20000;
     const reader = { load(line, done) {
@@ -177,4 +226,38 @@ test("Indexed viewport queries match a full scan before and after swapping axes"
     loader.reset();
     await loader.axisIndexes.waitForIdle();
     assert.equal(loader.axisIndexes.memoryBytes, 0);
+});
+
+
+test("Sparse refinement retains every row and respects a limited shared budget", async () => {
+    const rows = 120003;
+    const makeColumn = (max, stride, range) => {
+        const buffer = Int32Array.from({ length: rows }, (_, i) => i === rows - 1 ? max : i * stride % range);
+        return { buffer, stat: { min: 0, max, deviationFromMax: max }, getNumber(i) { return buffer[i]; } };
+    };
+    const x = makeColumn(11002192, 7919, 400000), y = makeColumn(25000174, 8191, 700000);
+    const cache = new AxisIndexCache(8 * 1024 * 1024);
+    let peak = 0;
+    cache.onProgress = () => { peak = Math.max(peak, cache.memoryBytes); };
+    cache.prepare([x, y], rows, () => {});
+    await cache.waitForIdle();
+    const index = cache.getOverview([x, y]), fine = index.fine;
+    assert.ok(fine && fine.factorX * fine.factorY > 1);
+    assert.ok(peak <= cache.budgetBytes && cache.memoryBytes <= cache.budgetBytes);
+    const seen = new Uint8Array(rows), maxima = new Uint32Array(index.levels[0].heads.length);
+    for (let slot = 0; slot < fine.cells.length; slot += 2) {
+        const key = fine.cells[slot], head = fine.cells[slot + 1];
+        if (slot) assert.ok(fine.cells[slot - 2] < key);
+        const bx = key % fine.width, by = Math.floor(key / fine.width);
+        const cell = Math.floor(by / fine.factorY) * index.levels[0].width + Math.floor(bx / fine.factorX);
+        maxima[cell] = Math.max(maxima[cell], head);
+        for (let link = head; link; link = index.next[link - 1]) {
+            assert.equal(seen[link - 1]++, 0);
+            assert.ok(index.next[link - 1] < link);
+        }
+    }
+    assert.deepEqual(maxima, index.levels[0].heads);
+    assert.ok(seen.every(value => value === 1));
+    assert.equal(index.levels.at(-1).heads[0], rows);
+    cache.clear();
 });
