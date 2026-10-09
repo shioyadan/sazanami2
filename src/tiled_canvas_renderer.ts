@@ -111,9 +111,9 @@ class TiledCanvasRenderer {
         }
         const key = `${context.scaleXLog},${context.scaleYLog}`;
         if (this.tileLayer_?.key !== key) {
+            this.capturePreviousTiles();
             this.cancelTileJobs();
             this.tilePrefetchDisabled_ = false;
-            if (this.tileLayer_ && Array.from(this.tiles_.values()).some(tile => tile.layer === this.tileLayer_)) this.tileFallback_ = this.tileLayer_;
             // 同じ倍率へ戻る時は以前の画素位相も再利用する。端数panは物理pixelへ揃えて貼る。
             this.tileLayer_ = Array.from(this.tiles_.values()).find(tile => tile.layer.key === key)?.layer ?? {
                 key, sx: scaleX(context.scaleXLog), sy: scaleY(context.scaleYLog),
@@ -152,12 +152,24 @@ class TiledCanvasRenderer {
         const ctx = canvas.getContext("2d")!;
         ctx.save(); ctx.resetTransform();
         ctx.fillStyle = "#1c1e23"; ctx.fillRect(0, 0, canvas.width, canvas.height);
-        ctx.imageSmoothingEnabled = false;
-        if (!complete && previous) {
-            ctx.drawImage(previous.canvas, px, py, previous.canvas.width * psx, previous.canvas.height * psy);
-        }
-        if (!complete && this.tileFallback_ && this.tileFallback_ !== request.layer) {
-            for (const tile of this.tiles_.values()) if (tile.layer === this.tileFallback_) this.blitTile(ctx, tile, request);
+        if (!complete) {
+            const drawPrevious = () => {
+                if (!previous) return;
+                // 縮小中の1pxの点をnearest-neighborで落とさず、軸の余白で外周tileを隠さない。
+                ctx.imageSmoothingEnabled = psx !== 1 || psy !== 1;
+                const left = this.renderer_.MARGIN_LEFT_ * ratio.x;
+                const width = previous.canvas.width - left;
+                const height = (previous.context.height - this.renderer_.MARGIN_BOTTOM_) * ratio.y;
+                ctx.drawImage(previous.canvas, left, 0, width, height, px + left * psx, py, width * psx, height * psy);
+            };
+            const snapshotOnTop = previous && this.tileFallback_?.sx === scaleX(previous.context.scaleXLog) &&
+                this.tileFallback_.sy === scaleY(previous.context.scaleYLog);
+            if (!snapshotOnTop) drawPrevious();
+            if (this.tileFallback_ && this.tileFallback_ !== request.layer) {
+                for (const tile of this.tiles_.values()) if (tile.layer === this.tileFallback_) this.blitTile(ctx, tile, request);
+            }
+            // 同じ完成倍率ならviewport画像を優先し、tileごとの拡縮・丸めで細い点を再び落とさない。
+            if (snapshotOnTop) drawPrevious();
         }
         const tiles: PlotTile[] = [];
         for (const job of visible) {
@@ -167,10 +179,41 @@ class TiledCanvasRenderer {
             this.blitTile(ctx, tile, request); tiles.push(tile);
         }
         ctx.restore();
-        if (complete) this.tileGrid(gridMap, tiles, view, context);
-        else gridMap.drawnIndex = null;
+        if (complete) {
+            // 途中倍率の数枚だけで完成済みのfallbackを置き換えると、残りが空白に戻る。
+            this.tileFallback_ = request.layer;
+            this.tileGrid(gridMap, tiles, view, context);
+        } else gridMap.drawnIndex = null;
         this.renderer_.drawAxes(ctx, view, context);
         return true;
+    }
+
+    private capturePreviousTiles(): void {
+        const request = this.tileRequest_;
+        if (!request) return;
+        const visible = this.tilePositions(request).filter(job => job.visible);
+        if (!visible.every(job => this.tiles_.has(job.key))) return;
+        const { context: c, ratio: r, layer } = request;
+        // 最後の生成完了から再描画までの間にzoomが来ても、完成した倍率を使う。
+        this.tileFallback_ = layer;
+        const width = Math.round(c.width * r.x), height = Math.round(c.height * r.y);
+        if (width * height * 4 > 16 * 1024 * 1024) return;
+        // pan中は毎frameコピーせず、倍率変更時だけ最新の完成viewportを軸なしで保存する。
+        const canvas = this.previousPlot_?.canvas ?? document.createElement("canvas");
+        canvas.width = width; canvas.height = height;
+        const ctx = canvas.getContext("2d")!;
+        ctx.fillStyle = "#1c1e23"; ctx.fillRect(0, 0, width, height);
+        ctx.save(); ctx.beginPath();
+        ctx.rect(this.renderer_.MARGIN_LEFT_ * r.x, 0, width - this.renderer_.MARGIN_LEFT_ * r.x,
+            (c.height - this.renderer_.MARGIN_BOTTOM_) * r.y);
+        ctx.clip();
+        for (const job of visible) this.blitTile(ctx, this.tiles_.get(job.key)!, request);
+        ctx.restore();
+        // 保存画像は整数blit後なので、元の小数offsetではなく実際の画素位置を記録する。
+        this.previousPlot_ = { canvas, context: { ...c,
+            offsetX: (this.renderer_.MARGIN_LEFT_ * r.x + layer.phaseX -
+                Math.round(this.renderer_.MARGIN_LEFT_ * r.x + layer.phaseX - c.offsetX * r.x)) / r.x,
+            offsetY: (layer.phaseY - Math.round(layer.phaseY - c.offsetY * r.y)) / r.y } };
     }
 
     private tileBounds(tile: PlotTile, request: TileRequest): [number, number, number, number] {
@@ -187,6 +230,7 @@ class TiledCanvasRenderer {
     private blitTile(ctx: CanvasRenderingContext2D, tile: PlotTile, request: TileRequest): void {
         const [x0, y0, x1, y1] = this.tileBounds(tile, request);
         if (x1 <= 0 || y1 <= 0 || x0 >= ctx.canvas.width || y0 >= ctx.canvas.height) return;
+        ctx.imageSmoothingEnabled = tile.layer.sx !== request.layer.sx || tile.layer.sy !== request.layer.sy;
         if (tile.canvas) ctx.drawImage(tile.canvas, x0, y0, x1 - x0, y1 - y0);
         else { ctx.fillStyle = "#1c1e23"; ctx.fillRect(x0, y0, x1 - x0, y1 - y0); }
     }

@@ -544,7 +544,7 @@ function tileEnvironment() {
     function makeCanvas(width = 0, height = 0, clientWidth = 0, clientHeight = 0) {
         const canvas = { width, height, clientWidth, clientHeight };
         const ctx = { canvas, save() {}, restore() {}, resetTransform() {}, setTransform() {}, drawImage() {},
-            fillRect() {}, beginPath() {}, moveTo() {}, lineTo() {}, stroke() {}, fillText() {} };
+            fillRect() {}, beginPath() {}, rect() {}, clip() {}, moveTo() {}, lineTo() {}, stroke() {}, fillText() {} };
         canvas.getContext = () => ctx;
         canvases.push(canvas);
         return canvas;
@@ -649,6 +649,55 @@ test("Tiles reuse integer pans and previous zoom levels without rerunning row se
         context = { ...context, offsetX: 40000, offsetY: 40000 };
         paint();
         assert.ok(selections > 0, "A distant jump must use direct rendering instead of a blank provisional image");
+    } finally { env.restore(); loader.reset(); }
+});
+
+test("Rapid zooms keep the last complete layer instead of an incomplete intermediate layer", () => {
+    const { loader, view } = load(gridCSV), env = tileEnvironment(), { tiledRenderer, canvas } = env;
+    let context = { ...INITIAL_RENDERER_CONTEXT, width: 690, height: 340, scaleXLog: Math.log(10), scaleYLog: Math.log(10) };
+    const paint = () => tiledRenderer.draw(canvas, new GridMap(), view, context, () => {}, { tiled: true });
+    try {
+        // 完成通知後の再描画を挟まずzoomし、直前frameで未確認の完成tileも引き継ぐ。
+        paint(); env.drain();
+        const completeLayer = tiledRenderer.tileLayer_;
+        context = { ...context, scaleXLog: Math.log(11), scaleYLog: Math.log(11) };
+        paint();
+        const [timerId, timer] = env.timers.entries().next().value;
+        env.timers.delete(timerId); timer();
+        const [frameId, frame] = env.frames.entries().next().value;
+        env.frames.delete(frameId); frame();
+        const intermediate = tiledRenderer.tileLayer_;
+        assert.ok(Array.from(tiledRenderer.tiles_.values()).some(tile => tile.layer === intermediate));
+        assert.ok(tiledRenderer.tileJobs_.some(job => job.visible), "The intermediate scale must still be incomplete");
+        context = { ...context, scaleXLog: Math.log(12), scaleYLog: Math.log(12) };
+        paint();
+        assert.equal(tiledRenderer.tileFallback_, completeLayer, "An incomplete scale must not replace a complete fallback");
+    } finally { env.restore(); loader.reset(); }
+});
+
+test("Zoom reuses the latest complete pan with smoothing and keeps final tiles sharp", () => {
+    const { loader, view } = load(gridCSV), env = tileEnvironment(), { tiledRenderer, canvas } = env;
+    let context = { ...INITIAL_RENDERER_CONTEXT, width: 690, height: 340, scaleXLog: Math.log(10), scaleYLog: Math.log(10) };
+    const paint = () => tiledRenderer.draw(canvas, new GridMap(), view, context, () => {}, { tiled: true });
+    const copies = [], ctx = canvas.getContext("2d");
+    ctx.drawImage = image => copies.push({ image, smooth: ctx.imageSmoothingEnabled });
+    try {
+        paint(); env.drain();
+        context = { ...context, offsetX: 8, offsetY: 4 };
+        paint(); env.drain(); paint();
+        const pan = context;
+        context = { ...context, scaleXLog: Math.log(5), scaleYLog: Math.log(5) };
+        copies.length = 0; paint();
+        assert.equal(tiledRenderer.previousPlot_.context.offsetX, pan.offsetX);
+        assert.equal(tiledRenderer.previousPlot_.context.offsetY, pan.offsetY);
+        assert.equal(tiledRenderer.previousPlot_.context.scaleXLog, pan.scaleXLog);
+        assert.ok(copies.some(copy => copy.image === tiledRenderer.previousPlot_.canvas && copy.smooth),
+            "Thin source pixels must survive provisional downscaling");
+        assert.equal(copies.at(-1).image, tiledRenderer.previousPlot_.canvas,
+            "Resampled tile edges must not overwrite the complete viewport image");
+        env.drain(); copies.length = 0; paint();
+        assert.ok(copies.length);
+        assert.ok(copies.every(copy => !copy.smooth), "Completed tiles must use sharp integer blits");
     } finally { env.restore(); loader.reset(); }
 });
 
