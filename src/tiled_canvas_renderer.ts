@@ -1,11 +1,11 @@
 import { CanvasRenderer, GridMap, scaleX, scaleY } from "./canvas_renderer";
 import type { RendererContext } from "./canvas_renderer";
 import type { DataView } from "./loader";
-import { RectRendererSoft } from "./rect_renderer";
+import { RectRendererSoft, RectRendererWebGL } from "./rect_renderer";
 
 type PixelScale = { x: number; y: number };
 type TileLayer = { key: string; sx: number; sy: number; phaseX: number; phaseY: number };
-type PlotTile = { layer: TileLayer; x: number; y: number; canvas: HTMLCanvasElement | null; rows: Uint32Array; bytes: number };
+type PlotTile = { layer: TileLayer; x: number; y: number; canvas: HTMLCanvasElement | null; rows: Uint32Array; bytes: number; readyAt?: number };
 type TileJob = { key: string; x: number; y: number; visible: boolean; priority: number };
 type TileRequest = { view: DataView; context: RendererContext; ratio: PixelScale; layer: TileLayer; requestDraw: () => void };
 
@@ -25,10 +25,12 @@ class TiledCanvasRenderer {
     private tileTimer_: number | null = null;
     private tileGeneration_ = 0;
     private tilePrefetchDisabled_ = false;
+    private tileFading_ = false;
     private tileBypass_: { view: DataView; key: string } | null = null;
     private previousPlot_: { canvas: HTMLCanvasElement; context: RendererContext } | null = null;
     private static readonly TILE_SIZE = 256;
     private static readonly TILE_BUDGET = 64 * 1024 * 1024;
+    private static readonly TILE_FADE_MS = 120;
 
     constructor(private readonly renderer_: CanvasRenderer) {}
 
@@ -37,6 +39,7 @@ class TiledCanvasRenderer {
         if (this.tileFrame_ !== null) window.cancelAnimationFrame(this.tileFrame_);
         if (this.tileTimer_ !== null) window.clearTimeout(this.tileTimer_);
         this.tileFrame_ = this.tileTimer_ = null;
+        this.tileFading_ = false;
         this.tileJobs_ = [];
         if (this.tilePending_) this.tilePending_.canvas.width = 1;
         this.tilePending_ = null;
@@ -73,7 +76,7 @@ class TiledCanvasRenderer {
                 return;
             }
             // 初回や遠いjumpは従来描画を見せ、完成画像を後続のtile生成中にも使う。
-            const rows = this.renderer_.draw(canvas, gridMap, dataView, context, requestDraw, { axes: false });
+            const rows = this.renderer_.draw(canvas, gridMap, dataView, context, requestDraw, { axes: false, smoothOverview: true });
             if (rows !== null) {
                 if (canvas.width * canvas.height * 4 <= 16 * 1024 * 1024) {
                     const previous = this.previousPlot_?.canvas ?? document.createElement("canvas");
@@ -132,8 +135,13 @@ class TiledCanvasRenderer {
         if (this.tilePending_ && !this.tileJobs_.some(job => job.key === this.tilePending_!.job.key)) {
             this.tileBuilder_?.cancelPendingRows(); this.tilePending_.canvas.width = 1; this.tilePending_ = null;
         }
+        const now = performance.now();
+        this.tileFading_ = visible.some(job => {
+            const readyAt = this.tiles_.get(job.key)?.readyAt;
+            return readyAt !== undefined && now - readyAt < TiledCanvasRenderer.TILE_FADE_MS;
+        });
         this.scheduleTiles();
-        const complete = visible.every(job => this.tiles_.has(job.key));
+        const complete = !this.tileFading_ && visible.every(job => this.tiles_.has(job.key));
         if (!complete && !this.previousPlot_ && !this.tileFallback_) return false;
         const previous = this.previousPlot_, psx = previous ? request.layer.sx / scaleX(previous.context.scaleXLog) : 1;
         const psy = previous ? request.layer.sy / scaleY(previous.context.scaleYLog) : 1;
@@ -151,6 +159,7 @@ class TiledCanvasRenderer {
         }
         const ctx = canvas.getContext("2d")!;
         ctx.save(); ctx.resetTransform();
+        ctx.globalAlpha = 1;
         ctx.fillStyle = "#1c1e23"; ctx.fillRect(0, 0, canvas.width, canvas.height);
         if (!complete) {
             const drawPrevious = () => {
@@ -162,13 +171,14 @@ class TiledCanvasRenderer {
                 const height = (previous.context.height - this.renderer_.MARGIN_BOTTOM_) * ratio.y;
                 ctx.drawImage(previous.canvas, left, 0, width, height, px + left * psx, py, width * psx, height * psy);
             };
-            const snapshotOnTop = previous && this.tileFallback_?.sx === scaleX(previous.context.scaleXLog) &&
-                this.tileFallback_.sy === scaleY(previous.context.scaleYLog);
+            const snapshotOnTop = previous && ((this.tileFallback_?.sx === scaleX(previous.context.scaleXLog) &&
+                this.tileFallback_.sy === scaleY(previous.context.scaleYLog)) ||
+                (previous.context.scaleXLog === context.scaleXLog && previous.context.scaleYLog === context.scaleYLog));
             if (!snapshotOnTop) drawPrevious();
             if (this.tileFallback_ && this.tileFallback_ !== request.layer) {
                 for (const tile of this.tiles_.values()) if (tile.layer === this.tileFallback_) this.blitTile(ctx, tile, request);
             }
-            // 同じ完成倍率ならviewport画像を優先し、tileごとの拡縮・丸めで細い点を再び落とさない。
+            // 完成viewportを優先する。大きなjump後の直接描画も、古い倍率のtileで上書きしない。
             if (snapshotOnTop) drawPrevious();
         }
         const tiles: PlotTile[] = [];
@@ -176,8 +186,11 @@ class TiledCanvasRenderer {
             const tile = this.tiles_.get(job.key);
             if (!tile) continue;
             this.tiles_.delete(job.key); this.tiles_.set(job.key, tile);
+            // 拡縮した旧画像と最小1pxの新しい点の密度差を、短時間で徐々に切り替える。
+            ctx.globalAlpha = tile.readyAt === undefined ? 1 : Math.max(0, Math.min(1, (now - tile.readyAt) / TiledCanvasRenderer.TILE_FADE_MS));
             this.blitTile(ctx, tile, request); tiles.push(tile);
         }
+        ctx.globalAlpha = 1;
         ctx.restore();
         if (complete) {
             // 途中倍率の数枚だけで完成済みのfallbackを置き換えると、残りが空白に戻る。
@@ -192,7 +205,11 @@ class TiledCanvasRenderer {
         const request = this.tileRequest_;
         if (!request) return;
         const visible = this.tilePositions(request).filter(job => job.visible);
-        if (!visible.every(job => this.tiles_.has(job.key))) return;
+        const now = performance.now();
+        if (!visible.every(job => {
+            const tile = this.tiles_.get(job.key);
+            return tile && (tile.readyAt === undefined || now - tile.readyAt >= TiledCanvasRenderer.TILE_FADE_MS);
+        })) return;
         const { context: c, ratio: r, layer } = request;
         // 最後の生成完了から再描画までの間にzoomが来ても、完成した倍率を使う。
         this.tileFallback_ = layer;
@@ -251,10 +268,15 @@ class TiledCanvasRenderer {
     }
 
     private scheduleTiles(): void {
-        if (this.tileFrame_ !== null || this.tileTimer_ !== null || !this.tileJobs_.length || !this.tileRequest_) return;
-        // 表示準備の完了通知が来るまではRAFを回し続けない。
-        if (this.tileBuilder_?.isPreparingRows) return;
-        this.tileFrame_ = window.requestAnimationFrame(() => { this.tileFrame_ = null; this.renderTileBatch(); });
+        if (this.tileFrame_ !== null || this.tileTimer_ !== null || !this.tileRequest_) return;
+        const build = this.tileJobs_.length && !this.tileBuilder_?.isPreparingRows;
+        // 未完了の行準備だけなら通知を待つ。画像の切替中だけは再描画を続ける。
+        if (!build && !this.tileFading_) return;
+        this.tileFrame_ = window.requestAnimationFrame(() => {
+            this.tileFrame_ = null;
+            if (build) this.renderTileBatch();
+            else this.tileRequest_?.requestDraw();
+        });
     }
 
     private renderTileBatch(): void {
@@ -280,12 +302,13 @@ class TiledCanvasRenderer {
             // タイル内の候補数は画面全体より少ない。同じ画素への重複は小さい範囲でもまとめる。
             const rows = builder.draw(pending.canvas, new GridMap(), request.view, pending.context, () => {
                 if (generation === this.tileGeneration_ && this.tilePending_ === pending) this.scheduleTiles();
-            }, { axes: false, aggregateSmallViews: true });
+            }, { axes: false, aggregateSmallViews: true, smoothOverview: true });
             if (rows === null) break;
             const canvas = rows.length ? pending.canvas : null;
             if (!canvas) pending.canvas.width = 1;
             const tile: PlotTile = { layer: request.layer, x: job.x, y: job.y, canvas, rows,
-                bytes: (canvas ? size * size * 4 : 128) + rows.byteLength };
+                bytes: (canvas ? size * size * 4 : 128) + rows.byteLength,
+                readyAt: job.visible && this.tileFallback_ && this.tileFallback_ !== request.layer && this.renderer_.rectRenderer instanceof RectRendererWebGL ? performance.now() : undefined };
             const visibleKeys = new Set(this.tilePositions(request).filter(position => position.visible).map(position => position.key));
             let visibleBytes = 0;
             for (const [key, cached] of this.tiles_) if (visibleKeys.has(key)) visibleBytes += cached.bytes;
@@ -317,7 +340,7 @@ class TiledCanvasRenderer {
             changed ||= visibleKeys.has(job.key); count++;
             if (performance.now() - start >= budget) break;
         }
-        if (changed) request.requestDraw();
+        if (changed || this.tileFading_) request.requestDraw();
         this.scheduleTiles();
     }
 }

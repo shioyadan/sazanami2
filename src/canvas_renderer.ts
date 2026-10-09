@@ -619,7 +619,7 @@ class CanvasRenderer {
 
     // 完成した描画対象を返す。準備が非同期で未完了ならnullを返し、完了時にrequestDrawを呼ぶ。
     draw(canvas: HTMLCanvasElement, gridMap: GridMap, dataView: DataView | null, renderCtx: RendererContext,
-        requestDraw?: () => void, options?: { axes?: boolean; aggregateSmallViews?: boolean }): Uint32Array | null {
+        requestDraw?: () => void, options?: { axes?: boolean; aggregateSmallViews?: boolean; smoothOverview?: boolean }): Uint32Array | null {
         const aggregateSmallViews = options?.aggregateSmallViews ?? false;
         if (aggregateSmallViews !== this.aggregateSmallViews_) {
             this.cancelPendingRows();
@@ -668,10 +668,20 @@ class CanvasRenderer {
         // 終端を整数へ丸めず、部分表示のセルや派生列の小数座標も描画対象にする。
         // DOM外のCanvasではclient寸法が0なので、明示した論理寸法を使う。
         const logicalWidth = canvas.clientWidth || renderCtx.width, logicalHeight = canvas.clientHeight || renderCtx.height;
-        const pixelRatio = {
+        const displayRatio = {
             x: canvas.width && logicalWidth ? canvas.width / logicalWidth : 1,
             y: canvas.height && logicalHeight ? canvas.height / logicalHeight : 1
         };
+        const colorPalette = dataView.getPalette();
+        // 縮小された整数カテゴリ＋時間軸は1画素の最後の色が倍率で入れ替わる。
+        // 2×2の被覆を既存索引で求めて平均し、周期的な色や疎な点のちらつきを抑える。
+        // 高DPRは既に細かい画素を持つ。互換描画・半透明・大きな点は従来どおり。
+        const samples = options?.smoothOverview && this.rectRenderer instanceof RectRendererWebGL && this.exactOverview(dataView) &&
+            renderCtx.minPlotWidth <= 1 && renderCtx.minPlotHeight <= 1 && Math.max(displayRatio.x, displayRatio.y) < 2 &&
+            Math.min(pxW * displayRatio.x, pxH * displayRatio.y) <= 2 &&
+            canvas.width > 0 && canvas.height > 0 && canvas.width * canvas.height * 16 <= 16 * 1024 * 1024 &&
+            colorPalette.every(color => (color >>> 24) === 255) ? 2 : 1;
+        const pixelRatio = { x: displayRatio.x * samples, y: displayRatio.y * samples };
         const rows = this.prepareRows(dataView, renderCtx, pixelRatio, requestDraw);
         if (!rows) {
             gridMap.drawnIndex = null;
@@ -691,12 +701,11 @@ class CanvasRenderer {
         const gridRowRatio = gridRows / visibleRows;
 
         // データ描画＆インデックス記録
-        const colorPalette = dataView.getPalette();
         const raster = this.rectRenderer instanceof RectRendererWebGL && this.exactOverview(dataView) &&
-            canvas.width > 0 && canvas.height > 0 && canvas.width * canvas.height * 4 <= 16 * 1024 * 1024 &&
-            Math.min(pxW * pixelRatio.x, pxH * pixelRatio.y) <= 2 && colorPalette.every(color => (color >>> 24) === 255) &&
-            rows.length * Math.ceil(pxW * pixelRatio.x) * Math.ceil(pxH * pixelRatio.y) <= canvas.width * canvas.height * 4;
-        if (raster && this.rectRenderer instanceof RectRendererWebGL) this.rectRenderer.beginRasterMode(canvas, 0xff231e1c, logicalWidth, logicalHeight);
+            canvas.width > 0 && canvas.height > 0 && canvas.width * canvas.height * samples * samples * 4 <= 16 * 1024 * 1024 &&
+            Math.min(pxW * pixelRatio.x, pxH * pixelRatio.y) <= 2 * samples && colorPalette.every(color => (color >>> 24) === 255) &&
+            (samples === 2 || rows.length * Math.ceil(pxW * pixelRatio.x) * Math.ceil(pxH * pixelRatio.y) <= canvas.width * canvas.height * 4);
+        if (raster && this.rectRenderer instanceof RectRendererWebGL) this.rectRenderer.beginRasterMode(canvas, 0xff231e1c, logicalWidth, logicalHeight, samples);
         else this.rectRenderer.beginRawMode(canvas, scaleYVal, logicalWidth, logicalHeight);
 
         for (const i of rows) {

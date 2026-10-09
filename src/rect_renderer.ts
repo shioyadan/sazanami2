@@ -44,6 +44,8 @@ class RectRendererWebGL {
     private rasterMode_: boolean = false;
     private rasterImage_: ImageData | null = null;
     private rasterPixels_: Uint32Array | null = null;
+    private rasterSamples_: 1 | 2 = 1;
+    private rasterOutput_: ImageData | null = null;
     private cap_: number = 0;
     private count_: number = 0;
     private pos_: Float32Array = new Float32Array(0);
@@ -74,15 +76,16 @@ class RectRendererWebGL {
 
     // 不透明な細い点は画素へ直接描き、GL描画後のCanvas間転送を避ける。
     // 適用条件と画像サイズの上限はCanvasRendererが判定する。
-    beginRasterMode(canvas: HTMLCanvasElement, background: number, width = canvas.clientWidth, height = canvas.clientHeight): void {
+    beginRasterMode(canvas: HTMLCanvasElement, background: number, width = canvas.clientWidth, height = canvas.clientHeight, samples: 1 | 2 = 1): void {
         const ctx = canvas.getContext("2d");
         if (!ctx) throw new Error("2D rendering context could not be obtained.");
         this.ctx2d_ = ctx;
-        this.imageWidthDOM_ = canvas.width; this.imageHeightDOM_ = canvas.height;
-        this.imageWidthScale_ = canvas.width / Math.max(1, width);
-        this.imageHeightScale_ = canvas.height / Math.max(1, height);
-        if (!this.rasterImage_ || this.rasterImage_.width !== canvas.width || this.rasterImage_.height !== canvas.height) {
-            this.rasterImage_ = ctx.createImageData(canvas.width, canvas.height);
+        this.rasterSamples_ = samples;
+        this.imageWidthDOM_ = canvas.width * samples; this.imageHeightDOM_ = canvas.height * samples;
+        this.imageWidthScale_ = this.imageWidthDOM_ / Math.max(1, width);
+        this.imageHeightScale_ = this.imageHeightDOM_ / Math.max(1, height);
+        if (!this.rasterImage_ || this.rasterImage_.width !== this.imageWidthDOM_ || this.rasterImage_.height !== this.imageHeightDOM_) {
+            this.rasterImage_ = ctx.createImageData(this.imageWidthDOM_, this.imageHeightDOM_);
             this.rasterPixels_ = new Uint32Array(this.rasterImage_.data.buffer);
         }
         this.rasterPixels_!.fill(background);
@@ -140,7 +143,24 @@ class RectRendererWebGL {
     endRawMode(): void {
         if (!this.rawMode_) return;
         if (this.rasterMode_) {
-            this.ctx2d_!.putImageData(this.rasterImage_!, 0, 0);
+            let image = this.rasterImage_!;
+            if (this.rasterSamples_ === 2) {
+                const width = image.width / 2, height = image.height / 2;
+                if (!this.rasterOutput_ || this.rasterOutput_.width !== width || this.rasterOutput_.height !== height) {
+                    this.rasterOutput_ = this.ctx2d_!.createImageData(width, height);
+                }
+                const source = this.rasterPixels_!, output = new Uint32Array(this.rasterOutput_.data.buffer);
+                // 不透明な2×2画素を面積で平均する。Canvasの補間品質やGPUに結果を依存させない。
+                for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+                    const p = y * 2 * image.width + x * 2;
+                    const a = source[p], b = source[p + 1], c = source[p + image.width], d = source[p + image.width + 1];
+                    const rb = (((a & 0xff00ff) + (b & 0xff00ff) + (c & 0xff00ff) + (d & 0xff00ff) + 0x020002) >>> 2) & 0xff00ff;
+                    const g = (((a & 0xff00) + (b & 0xff00) + (c & 0xff00) + (d & 0xff00) + 0x0200) >>> 2) & 0xff00;
+                    output[y * width + x] = 0xff000000 | rb | g;
+                }
+                image = this.rasterOutput_;
+            }
+            this.ctx2d_!.putImageData(image, 0, 0);
             this.rasterMode_ = false;
             this.rawMode_ = false;
             return;

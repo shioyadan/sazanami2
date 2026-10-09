@@ -76,6 +76,9 @@ view definitions for matching column headers between browser sessions.
 Indexes for the active axes are built on demand within a memory budget. Index construction and
 large-view preparation run incrementally so you can continue interacting with the app. WebGL
 overview rendering combines points covering the same pixels and retains the last row's color.
+For dense integer traces, tiled rendering averages finer pixel coverage to reduce abrupt changes
+in color and density while zooming. Overview colors can therefore blend several points. New zoom
+tiles appear gradually over the previous image. Turn off tiled rendering to retain direct rendering.
 Tile rendering aligns panning to physical pixels to keep cached images sharp.
 
 ### Load data from a server

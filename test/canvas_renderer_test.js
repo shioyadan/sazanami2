@@ -506,6 +506,50 @@ test("Direct raster and GPU batches agree on clipped, overlapping and half-pixel
     assert.deepEqual(gpuPixels, expected);
 });
 
+test("Overview smoothing keeps alternating colors stable across a pixel boundary", async () => {
+    const n = 120000, csv = "category,time,color\n" + Array.from({ length: n }, (_, i) => `${0},${i % 32},${i % 2}`).join("\n");
+    const { loader, view } = load(csv, { view: { axisXField: "category", axisYField: "time", colorField: "color" }, columns: {} });
+    await loader.axisIndexes.waitForIdle();
+    view.getPalette = () => new Uint32Array([0xff0000ff, 0xffff0000]);
+    const { renderer, canvas } = makeRenderer(), backend = new RectRendererWebGL();
+    renderer.rectRenderer = backend;
+    canvas.clientWidth = canvas.width = 60; canvas.clientHeight = canvas.height = 36;
+    let displayed;
+    const ctx = canvas.getContext("2d");
+    ctx.createImageData = (width, height) => ({ width, height, data: new Uint8ClampedArray(width * height * 4) });
+    ctx.putImageData = image => displayed = new Uint32Array(image.data.buffer).slice();
+    const base = { ...INITIAL_RENDERER_CONTEXT, width: 60, height: 36, scaleXLog: Math.log(4), scaleYLog: Math.log(0.5) };
+    function pixel(offsetY, smoothOverview) {
+        renderer.draw(canvas, new GridMap(), view, { ...base, offsetY }, undefined, { axes: false, smoothOverview });
+        return displayed[5 * 60 + 52];
+    }
+    try {
+        assert.notEqual(pixel(-0.01, false), pixel(0.01, false), "A single sample changes the entire alternating pattern");
+        assert.equal(pixel(-0.01, true), 0xff800080);
+        assert.equal(pixel(0.01, true), 0xff800080, "Subpixel averaging must keep the same mixed color on both sides");
+        assert.equal(backend.rasterImage_.data.byteLength, 60 * 36 * 16);
+        assert.equal(backend.rasterOutput_.data.byteLength, 60 * 36 * 4);
+    } finally { loader.reset(); }
+});
+
+test("Subpixel raster averages coverage with background and reuses its output", () => {
+    const backend = new RectRendererWebGL(), canvas = { width: 2, height: 1, clientWidth: 2, clientHeight: 1 };
+    let image;
+    canvas.getContext = () => ({
+        createImageData(width, height) { return { width, height, data: new Uint8ClampedArray(width * height * 4) }; },
+        putImageData(value) { image = value; }
+    });
+    backend.beginRasterMode(canvas, 0xff231e1c, 2, 1, 2);
+    backend.fillRect(0, 0, 0.5, 0.5, 0xff0000ff);
+    backend.fillRect(1, 0, 1, 1, 0xffffffff);
+    backend.endRawMode();
+    assert.deepEqual(Array.from(image.data), [85, 23, 26, 255, 255, 255, 255, 255]);
+    const previous = image;
+    backend.beginRasterMode(canvas, 0xff231e1c, 2, 1, 2); backend.endRawMode();
+    assert.equal(image, previous);
+    assert.deepEqual(Array.from(image.data), [28, 30, 35, 255, 28, 30, 35, 255]);
+});
+
 test("Direct raster is limited to small opaque indexed points and bounded image memory", async () => {
     const n = 120003, csv = "category,time\n" + Array.from({ length: n }, (_, i) => `${i % 3},${i % 60001}`).join("\n");
     const { loader, view } = load(csv, { view: { axisXField: "category", axisYField: "time" }, columns: {} });
@@ -699,6 +743,59 @@ test("Zoom reuses the latest complete pan with smoothing and keeps final tiles s
         assert.ok(copies.length);
         assert.ok(copies.every(copy => !copy.smooth), "Completed tiles must use sharp integer blits");
     } finally { env.restore(); loader.reset(); }
+});
+
+test("A direct image after a large zoom jump stays above tiles from the old scale", () => {
+    const { loader, view } = load(gridCSV), env = tileEnvironment(), { tiledRenderer, canvas } = env;
+    let context = { ...INITIAL_RENDERER_CONTEXT, width: 690, height: 340, scaleXLog: Math.log(10), scaleYLog: Math.log(10) };
+    const paint = () => tiledRenderer.draw(canvas, new GridMap(), view, context, () => {}, { tiled: true });
+    const copies = [], ctx = canvas.getContext("2d");
+    ctx.drawImage = image => copies.push(image);
+    try {
+        paint(); env.drain(); paint();
+        context = { ...context, scaleXLog: Math.log(0.5), scaleYLog: Math.log(0.5) };
+        paint();
+        assert.equal(tiledRenderer.previousPlot_.context.scaleXLog, context.scaleXLog, "The large jump must first draw a complete direct image");
+        copies.length = 0; paint();
+        assert.equal(copies.at(-1), tiledRenderer.previousPlot_.canvas, "Old zoom tiles must not overwrite the newly completed image");
+    } finally { env.restore(); loader.reset(); }
+});
+
+test("Zoom tiles fade over the complete image and cancel the transition when disabled", () => {
+    const { loader, view } = load(gridCSV), env = tileEnvironment(), { renderer, tiledRenderer, canvas } = env;
+    const previousPerformance = global.performance;
+    let now = 1000, context = { ...INITIAL_RENDERER_CONTEXT, width: 690, height: 340, scaleXLog: Math.log(10), scaleYLog: Math.log(10) };
+    global.performance = { now: () => now };
+    Object.setPrototypeOf(renderer.rectRenderer, RectRendererWebGL.prototype);
+    const grid = new GridMap(), copies = [], ctx = canvas.getContext("2d");
+    ctx.drawImage = image => copies.push({ image, alpha: ctx.globalAlpha });
+    const paint = () => tiledRenderer.draw(canvas, grid, view, context, () => {}, { tiled: true });
+    try {
+        paint(); env.drain(); paint();
+        const completed = tiledRenderer.tileFallback_;
+        context = { ...context, scaleXLog: Math.log(11), scaleYLog: Math.log(11) };
+        paint(); env.drain(); copies.length = 0; paint();
+        const images = new Set(Array.from(tiledRenderer.tiles_.values()).filter(tile => tile.layer === tiledRenderer.tileLayer_).map(tile => tile.canvas));
+        assert.ok(copies.some(copy => images.has(copy.image) && copy.alpha === 0));
+        assert.equal(tiledRenderer.tileFallback_, completed);
+        assert.equal(grid.drawnIndex, null);
+        now += 60; copies.length = 0; paint();
+        assert.ok(copies.some(copy => images.has(copy.image) && copy.alpha === 0.5));
+        // 切替途中の再zoomでも未表示の完成画像へ飛ばず、最後の完成倍率を保つ。
+        const zoom = context;
+        context = { ...context, scaleXLog: Math.log(12) }; paint();
+        assert.equal(tiledRenderer.tileFallback_, completed);
+        context = zoom; paint();
+        now += 60; copies.length = 0; paint();
+        assert.ok(copies.some(copy => images.has(copy.image) && copy.alpha === 1));
+        assert.equal(tiledRenderer.tileFallback_, tiledRenderer.tileLayer_);
+        assert.ok(grid.drawnIndex);
+        context = { ...context, scaleXLog: Math.log(13) }; paint(); env.drain(); paint();
+        assert.equal(tiledRenderer.tileFading_, true);
+        tiledRenderer.draw(canvas, grid, view, context, () => {}, { tiled: false });
+        assert.equal(env.frames.size, 0);
+        assert.equal(tiledRenderer.tileFading_, false);
+    } finally { global.performance = previousPerformance; env.restore(); loader.reset(); }
 });
 
 test("Disabling tiles cancels queued work, releases images and restores direct drawing", () => {
