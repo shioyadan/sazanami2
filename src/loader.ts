@@ -510,6 +510,8 @@ class Loader {
         return this.numRows_;
     }
 
+    public get isLoading(): boolean { return this.loading_; }
+
     public GetDataView(dataViewDef: ViewDefinition | null): DataView | null {
         if (dataViewDef === null) 
             return null;

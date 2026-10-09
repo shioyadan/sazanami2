@@ -1,6 +1,6 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { Accordion } from "react-bootstrap";
-import Store, { ACTION } from "./store";
+import Store, { ACTION, CHANGE } from "./store";
 import ViewDefinitionEditor from "./view_definition_editor";
 import { BsX } from "react-icons/bs";
 
@@ -74,7 +74,19 @@ export const ViewSettingsPanel: React.FC<{ store: Store }> = ({ store }) => {
     );
 };
 
-/** Settings 本体 */
+const CompatibilitySettingsPanel: React.FC<{ store: Store }> = ({ store }) => {
+    const [tiled, setTiled] = useState(store.state.tiledRenderingEnabled);
+    useEffect(() => {
+        const update = () => setTiled(store.state.tiledRenderingEnabled);
+        store.on(CHANGE.COMPATIBILITY_CHANGED, update);
+        return () => store.off(CHANGE.COMPATIBILITY_CHANGED, update);
+    }, [store]);
+    return <label style={{ padding: 10, display: "flex", gap: 8, alignItems: "center", color: TXT, fontSize: 13 }}>
+        <input type="checkbox" checked={tiled} onChange={event => store.trigger(ACTION.SET_TILED_RENDERING, event.target.checked)} />
+        Tiled rendering
+    </label>;
+};
+
 const SettingsPanel: React.FC<{ store: Store }> = ({ store }) => {
     return (
         <div style={{ display: "flex", flexDirection: "column", height: "100%", background: BG_PANEL }}>
@@ -116,6 +128,12 @@ const SettingsPanel: React.FC<{ store: Store }> = ({ store }) => {
                         <Accordion.Header>Render</Accordion.Header>
                         <Accordion.Body style={{ padding: 0 }}>
                             <RenderSettingsPanel store={store} />
+                        </Accordion.Body>
+                    </Accordion.Item>
+                    <Accordion.Item eventKey="compatibility">
+                        <Accordion.Header>Compatibility</Accordion.Header>
+                        <Accordion.Body style={{ padding: 0 }}>
+                            <CompatibilitySettingsPanel store={store} />
                         </Accordion.Body>
                     </Accordion.Item>
                 </Accordion>

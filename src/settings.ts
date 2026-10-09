@@ -3,6 +3,7 @@ import { ViewDefinition, DataView, inferViewDefinition } from "./data_view";
 
 class Settings { 
     viewDefMapHistory: Record<string, ViewDefinition> = {}; // key: concatenated column names
+    tiledRenderingEnabled = true;
 
     save() {
         try {
@@ -24,7 +25,7 @@ class Settings {
             for (const key of Object.keys(this)) {
                 if (Object.prototype.hasOwnProperty.call(obj, key)) {
                     const val = (obj as any)[key];
-                    if (val !== undefined) {
+                    if (val !== undefined && (typeof (this as any)[key] !== "boolean" || typeof val === "boolean")) {
                         (this as any)[key] = val;
                     }
                 }

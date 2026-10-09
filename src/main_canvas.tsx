@@ -1,9 +1,11 @@
 import React, { useRef, useEffect, createContext, useContext } from "react";
 import Store, { ACTION, CHANGE } from "./store";
 import { CanvasRenderer, RendererContext, GridMap, scaleX, scaleY } from "./canvas_renderer";
+import { TiledCanvasRenderer } from "./tiled_canvas_renderer";
 
 const MainCanvas: React.FC<{ store: Store }> = ({ store }) => {
     const rendererRef = useRef<CanvasRenderer>(new CanvasRenderer());
+    const tiledRendererRef = useRef<TiledCanvasRenderer>(new TiledCanvasRenderer(rendererRef.current));
     const gridMapRef = useRef<GridMap>(new GridMap());
     const divRef = useRef<HTMLDivElement>(null);
     const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -40,13 +42,15 @@ const MainCanvas: React.FC<{ store: Store }> = ({ store }) => {
 
     useEffect(() => {
         const renderer = rendererRef.current;
+        const tiledRenderer = tiledRendererRef.current;
         const gridMap = gridMapRef.current;
         let drawRaf: number | null = null;
         const draw = () => {
             if (drawRaf !== null) return;
             drawRaf = requestAnimationFrame(() => {
                 drawRaf = null;
-                renderer.draw(canvasRef.current!, gridMap, store.loader.GetDataView(store.state.viewDef), store.state.renderCtx, draw);
+                tiledRenderer.draw(canvasRef.current!, gridMap, store.loader.GetDataView(store.state.viewDef), store.state.renderCtx, draw,
+                    { tiled: store.state.tiledRenderingEnabled && !store.loader.isLoading });
             });
         };
 
@@ -548,6 +552,7 @@ const MainCanvas: React.FC<{ store: Store }> = ({ store }) => {
 
         // Store change handler
         const onFileLoadStarted = () => {
+            tiledRenderer.clear();
             renderer.cancelPendingRows();
             const next = { ...store.state.renderCtx, numRows: 0 };
             store.trigger(ACTION.UPDATE_RENDERER_CONTEXT, next);
@@ -595,6 +600,7 @@ const MainCanvas: React.FC<{ store: Store }> = ({ store }) => {
             cancelZoomAnimation();
             cancelPanAnimation();
             if (drawRaf !== null) cancelAnimationFrame(drawRaf);
+            tiledRenderer.clear();
             renderer.cancelPendingRows();
             ro.disconnect();
             store.off(CHANGE.FILE_LOADED, onContentUpdated);

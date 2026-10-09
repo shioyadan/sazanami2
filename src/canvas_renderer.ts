@@ -1,6 +1,6 @@
 // canvas_renderer.ts
 import { Loader, DataView } from "./loader";
-import { RectRendererSoft, RectRendererWebGL } from "./rect_renderer";
+import { RectRendererSoft, RectRendererWebGL, pixelEdge } from "./rect_renderer";
 import { yieldToUI } from "./axis_index";
 import type { OverviewIndex } from "./axis_index";
 
@@ -61,6 +61,7 @@ class CanvasRenderer {
     private pixelRows_: Uint32Array | null = null;
     private projectionTables_: Uint32Array[] = [];
     private refinementTables_: Uint32Array[] = [];
+    private aggregateSmallViews_ = false;
 
     private sameViewport(a: RendererContext, b: RendererContext): boolean {
         return a.width === b.width && a.height === b.height && a.offsetX === b.offsetX && a.offsetY === b.offsetY &&
@@ -68,9 +69,21 @@ class CanvasRenderer {
             a.minPlotWidth === b.minPlotWidth && a.minPlotHeight === b.minPlotHeight;
     }
 
-    cancelPendingRows(): void {
+    get isPreparingRows(): boolean { return this.pendingRows_ !== null; }
+
+    // 完成済みのviewportは残し、未完了の準備だけを中断する。
+    cancelRowPreparation(): void {
         this.rowGeneration_++;
         this.pendingRows_ = null;
+    }
+
+    // 呼出側が完成行を保持する場合、こちらの参照だけを解放して作業配列は再利用する。
+    releasePreparedRows(): void {
+        this.rowCache_ = this.fitRows_ = null;
+    }
+
+    cancelPendingRows(): void {
+        this.cancelRowPreparation();
         this.rowCache_ = null;
         this.fitRows_ = null;
         this.pixelRows_ = null;
@@ -99,8 +112,8 @@ class CanvasRenderer {
         const pixelEnd = (x: boolean) => Math.ceil((x ? context.width : context.height) * ratio(x));
         const clipEnd = (x: boolean) => x ? context.width : context.height - this.MARGIN_BOTTOM_;
         const footprint = (value: number, x: boolean) => {
-            const p = position(value, x), first = Math.max(0, Math.ceil(p * ratio(x) - 0.5));
-            const last = Math.min(pixelEnd(x), Math.ceil((p + point(x)) * ratio(x) - 0.5));
+            const p = position(value, x), first = Math.max(0, pixelEdge(p * ratio(x)));
+            const last = Math.min(pixelEnd(x), pixelEdge((p + point(x)) * ratio(x)));
             return first * (pixelEnd(x) + 1) + last;
         };
         for (let bin = 0; bin <= category.stat.max - category.stat.min; bin++) {
@@ -176,10 +189,10 @@ class CanvasRenderer {
             if (x1 + pointWidth < this.MARGIN_LEFT_ || x0 >= context.width || y1 + pointHeight < 0 || y0 >= context.height - this.MARGIN_BOTTOM_) continue;
             // 全点が描画範囲内で同じ画素矩形を覆うと確認できた領域だけ、最後の行へまとめる。
             if (x0 + pointWidth >= this.MARGIN_LEFT_ && x1 < context.width && y0 + pointHeight >= 0 && y1 < context.height - this.MARGIN_BOTTOM_ &&
-                Math.max(0, Math.ceil(x0 * pixelRatio.x - 0.5)) === Math.max(0, Math.ceil(x1 * pixelRatio.x - 0.5)) &&
-                Math.min(pixelWidth, Math.ceil((x0 + pointWidth) * pixelRatio.x - 0.5)) === Math.min(pixelWidth, Math.ceil((x1 + pointWidth) * pixelRatio.x - 0.5)) &&
-                Math.max(0, Math.ceil(y0 * pixelRatio.y - 0.5)) === Math.max(0, Math.ceil(y1 * pixelRatio.y - 0.5)) &&
-                Math.min(pixelHeight, Math.ceil((y0 + pointHeight) * pixelRatio.y - 0.5)) === Math.min(pixelHeight, Math.ceil((y1 + pointHeight) * pixelRatio.y - 0.5))) {
+                Math.max(0, pixelEdge(x0 * pixelRatio.x)) === Math.max(0, pixelEdge(x1 * pixelRatio.x)) &&
+                Math.min(pixelWidth, pixelEdge((x0 + pointWidth) * pixelRatio.x)) === Math.min(pixelWidth, pixelEdge((x1 + pointWidth) * pixelRatio.x)) &&
+                Math.max(0, pixelEdge(y0 * pixelRatio.y)) === Math.max(0, pixelEdge(y1 * pixelRatio.y)) &&
+                Math.min(pixelHeight, pixelEdge((y0 + pointHeight) * pixelRatio.y)) === Math.min(pixelHeight, pixelEdge((y1 + pointHeight) * pixelRatio.y))) {
                 yield head;
             } else if (levelNumber > 0) {
                 const child = index.levels[levelNumber - 1];
@@ -224,8 +237,8 @@ class CanvasRenderer {
             else {
                 const x = this.MARGIN_LEFT_ + xv * sx - context.offsetX, y = yv * sy - context.offsetY;
                 if (x + pw < this.MARGIN_LEFT_ || x >= context.width || y + ph < 0 || y >= context.height - this.MARGIN_BOTTOM_) continue;
-                const x0 = Math.max(0, Math.ceil(x * pixelRatio.x - 0.5)), x1 = Math.min(pixelWidth, Math.ceil((x + pw) * pixelRatio.x - 0.5));
-                const y0 = Math.max(0, Math.ceil(y * pixelRatio.y - 0.5)), y1 = Math.min(pixelHeight, Math.ceil((y + ph) * pixelRatio.y - 0.5));
+                const x0 = Math.max(0, pixelEdge(x * pixelRatio.x)), x1 = Math.min(pixelWidth, pixelEdge((x + pw) * pixelRatio.x));
+                const y0 = Math.max(0, pixelEdge(y * pixelRatio.y)), y1 = Math.min(pixelHeight, pixelEdge((y + ph) * pixelRatio.y));
                 if (x0 >= x1 || y0 >= y1) continue;
                 direct = x1 - x0 <= 2 && y1 - y0 <= 2;
                 key = direct ? (y0 * pixelWidth + x0) * 4 + (x1 - x0 - 1) * 2 + y1 - y0 - 1 : ((y0 * xBase + x0) * yBase + y1) * xBase + x1;
@@ -264,8 +277,8 @@ class CanvasRenderer {
                 let code = 0xffffffff;
                 if (min > column.stat.max || hi + point < margin || lo >= clipEnd) code = 0;
                 else if (lo + point >= margin && hi < clipEnd) {
-                    const first = Math.max(0, Math.ceil(lo * ratio - 0.5)), last = Math.min(pixelEnd, Math.ceil((lo + point) * ratio - 0.5));
-                    if (first === Math.max(0, Math.ceil(hi * ratio - 0.5)) && last === Math.min(pixelEnd, Math.ceil((hi + point) * ratio - 0.5))) {
+                    const first = Math.max(0, pixelEdge(lo * ratio)), last = Math.min(pixelEnd, pixelEdge((lo + point) * ratio));
+                    if (first === Math.max(0, pixelEdge(hi * ratio)) && last === Math.min(pixelEnd, pixelEdge((hi + point) * ratio))) {
                         const covered = last - first;
                         if (covered <= 0) code = 0;
                         else if (covered <= 2) code = first * (horizontal ? 4 : pixelWidth * 4) + (covered - 1) * (horizontal ? 2 : 1) + 1;
@@ -301,8 +314,8 @@ class CanvasRenderer {
                 else {
                     const x = this.MARGIN_LEFT_ + xv * sx - context.offsetX, y = yv * sy - context.offsetY;
                     if (x + pw < this.MARGIN_LEFT_ || x >= context.width || y + ph < 0 || y >= context.height - this.MARGIN_BOTTOM_) continue;
-                    const x0 = Math.max(0, Math.ceil(x * pixelRatio.x - 0.5)), x1 = Math.min(pixelWidth, Math.ceil((x + pw) * pixelRatio.x - 0.5));
-                    const y0 = Math.max(0, Math.ceil(y * pixelRatio.y - 0.5)), y1 = Math.min(pixelHeight, Math.ceil((y + ph) * pixelRatio.y - 0.5));
+                    const x0 = Math.max(0, pixelEdge(x * pixelRatio.x)), x1 = Math.min(pixelWidth, pixelEdge((x + pw) * pixelRatio.x));
+                    const y0 = Math.max(0, pixelEdge(y * pixelRatio.y)), y1 = Math.min(pixelHeight, pixelEdge((y + ph) * pixelRatio.y));
                     if (x0 >= x1 || y0 >= y1) continue;
                     direct = x1 - x0 <= 2 && y1 - y0 <= 2;
                     key = direct ? (y0 * pixelWidth + x0) * 4 + (x1 - x0 - 1) * 2 + y1 - y0 - 1 : ((y0 * xBase + x0) * yBase + y1) * xBase + x1;
@@ -314,13 +327,14 @@ class CanvasRenderer {
     }
 
     private *selectRows(view: DataView, context: RendererContext, pixelRatio: PixelScale, selection: ReturnType<DataView["getVisibleRows"]>): Generator<void, Uint32Array> {
+        if (selection.start >= selection.end) return new Uint32Array(0);
         const sx = scaleX(context.scaleXLog), sy = scaleY(context.scaleYLog);
         const width = context.width - this.MARGIN_LEFT_, height = context.height - this.MARGIN_BOTTOM_;
         const pointWidth = Math.max(sx, context.minPlotWidth), pointHeight = Math.max(sy, context.minPlotHeight);
         const pixelWidth = Math.ceil(context.width * pixelRatio.x), pixelHeight = Math.ceil(context.height * pixelRatio.y);
         const xBase = pixelWidth + 1, yBase = pixelHeight + 1;
         // 同じ画素範囲へ重なる点は、元の入力順で最後の行を残す。
-        const aggregate = !(this.rectRenderer instanceof RectRendererSoft) && selection.end - selection.start > 100000 &&
+        const aggregate = !(this.rectRenderer instanceof RectRendererSoft) && (this.aggregateSmallViews_ || selection.end - selection.start > 100000) &&
             xBase * xBase * yBase * yBase < Number.MAX_SAFE_INTEGER;
         const exact = aggregate ? this.exactOverview(view) : null;
         if (exact) return yield* this.selectExactRows(exact, context, pixelRatio);
@@ -367,9 +381,9 @@ class CanvasRenderer {
                     let code = 0xffffffff;
                     if (hi + pointSize < margin || lo >= clipEnd) code = 0;
                     else if (lo + pointSize >= margin && hi < clipEnd) {
-                        const first = Math.max(0, Math.ceil(lo * ratio - 0.5));
-                        const last = Math.min(pixelEnd, Math.ceil((lo + pointSize) * ratio - 0.5));
-                        if (first === Math.max(0, Math.ceil(hi * ratio - 0.5)) && last === Math.min(pixelEnd, Math.ceil((hi + pointSize) * ratio - 0.5))) {
+                        const first = Math.max(0, pixelEdge(lo * ratio));
+                        const last = Math.min(pixelEnd, pixelEdge((lo + pointSize) * ratio));
+                        if (first === Math.max(0, pixelEdge(hi * ratio)) && last === Math.min(pixelEnd, pixelEdge((hi + pointSize) * ratio))) {
                             const size = last - first;
                             if (size <= 0) code = 0;
                             else if (size <= 2) code = first * (horizontal ? 4 : pixelWidth * 4) + (size - 1) * (horizontal ? 2 : 1) + 1;
@@ -415,10 +429,10 @@ class CanvasRenderer {
                 const x = this.MARGIN_LEFT_ + view.getX(row) * sx - context.offsetX;
                 if (!Number.isFinite(x) || x + pointWidth < this.MARGIN_LEFT_ || x >= context.width) continue;
                 if (pixels) {
-                    const x0 = Math.max(0, Math.ceil(x * pixelRatio.x - 0.5));
-                    const x1 = Math.min(pixelWidth, Math.ceil((x + pointWidth) * pixelRatio.x - 0.5));
-                    const y0 = Math.max(0, Math.ceil(y * pixelRatio.y - 0.5));
-                    const y1 = Math.min(pixelHeight, Math.ceil((y + pointHeight) * pixelRatio.y - 0.5));
+                    const x0 = Math.max(0, pixelEdge(x * pixelRatio.x));
+                    const x1 = Math.min(pixelWidth, pixelEdge((x + pointWidth) * pixelRatio.x));
+                    const y0 = Math.max(0, pixelEdge(y * pixelRatio.y));
+                    const y1 = Math.min(pixelHeight, pixelEdge((y + pointHeight) * pixelRatio.y));
                     if (x0 >= x1 || y0 >= y1) continue;
                     const dx = x1 - x0, dy = y1 - y0;
                     if (pixelRows && dx <= 2 && dy <= 2) {
@@ -445,7 +459,7 @@ class CanvasRenderer {
             this.rowCache_ = this.fitRows_;
         }
         if (this.rowCache_?.view === view && this.rowCache_.pixelRatio.x === pixelRatio.x && this.rowCache_.pixelRatio.y === pixelRatio.y && this.sameViewport(this.rowCache_.context, context)) {
-            if (this.pendingRows_) { this.rowGeneration_++; this.pendingRows_ = null; }
+            if (this.pendingRows_) this.cancelRowPreparation();
             return this.rowCache_.rows;
         }
         if (this.pendingRows_?.view === view && this.pendingRows_.pixelRatio.x === pixelRatio.x && this.pendingRows_.pixelRatio.y === pixelRatio.y && this.sameViewport(this.pendingRows_.context, context)) return null;
@@ -457,7 +471,7 @@ class CanvasRenderer {
             (context.offsetX + context.width - this.MARGIN_LEFT_) / sx,
             (context.offsetY + context.height - this.MARGIN_BOTTOM_) / sy);
         const selection = this.selectRows(view, context, pixelRatio, range);
-        if (requestDraw && range.end - range.start > 100000) {
+        if (requestDraw && range.end - range.start > (this.aggregateSmallViews_ ? 8192 : 100000)) {
             // 少数の整数カテゴリの区間照会は短時間で終わる。最初のsliceで完成すれば
             // 同じフレームで描き、MessageChannelと次のRAFを余分に待たない。
             if (!(this.rectRenderer instanceof RectRendererSoft) && this.exactOverview(view)) {
@@ -495,7 +509,8 @@ class CanvasRenderer {
         }
     }
 
-    constructor() {
+    constructor(backend?: RectRendererSoft | RectRendererWebGL) {
+        if (backend) { this.rectRenderer = backend; return; }
         let rendererGL = new RectRendererWebGL();
         if (rendererGL.init()) {
             this.rectRenderer = rendererGL;
@@ -602,9 +617,16 @@ class CanvasRenderer {
     }
 
 
-    draw(canvas: HTMLCanvasElement, gridMap: GridMap, dataView: DataView | null, renderCtx: RendererContext, requestDraw?: () => void) {
+    // 完成した描画対象を返す。準備が非同期で未完了ならnullを返し、完了時にrequestDrawを呼ぶ。
+    draw(canvas: HTMLCanvasElement, gridMap: GridMap, dataView: DataView | null, renderCtx: RendererContext,
+        requestDraw?: () => void, options?: { axes?: boolean; aggregateSmallViews?: boolean }): Uint32Array | null {
+        const aggregateSmallViews = options?.aggregateSmallViews ?? false;
+        if (aggregateSmallViews !== this.aggregateSmallViews_) {
+            this.cancelPendingRows();
+            this.aggregateSmallViews_ = aggregateSmallViews;
+        }
         let canvasCtx = canvas.getContext("2d")!;
-        if (!canvasCtx) return;
+        if (!canvasCtx) return null;
 
         // let startTime = (new Date()).getTime();
 
@@ -615,13 +637,13 @@ class CanvasRenderer {
         if (!dataView) {
             this.cancelPendingRows();
             this.clear(canvasCtx, renderCtx);
-            return;
+            return null;
         }
 
         // プロット領域がサイズ０となると色々壊れるのでリターン
         const plotHeight = Math.max(height - this.MARGIN_BOTTOM_, 0);
         const plotWidth = Math.max(width - this.MARGIN_LEFT_, 0);
-        if (plotHeight <= 0 || plotWidth <= 0) { this.cancelPendingRows(); return; }
+        if (plotHeight <= 0 || plotWidth <= 0) { this.cancelPendingRows(); return null; }
 
         // データ座標での表示範囲。端数のスクロール位置でも端のセルを含める。
         const xMin = offsetX / scaleXVal;
@@ -644,14 +666,16 @@ class CanvasRenderer {
 
         // 左・上には、最小描画サイズによって画面内へ重なる点も含める。
         // 終端を整数へ丸めず、部分表示のセルや派生列の小数座標も描画対象にする。
+        // DOM外のCanvasではclient寸法が0なので、明示した論理寸法を使う。
+        const logicalWidth = canvas.clientWidth || renderCtx.width, logicalHeight = canvas.clientHeight || renderCtx.height;
         const pixelRatio = {
-            x: canvas.width && canvas.clientWidth ? canvas.width / canvas.clientWidth : 1,
-            y: canvas.height && canvas.clientHeight ? canvas.height / canvas.clientHeight : 1
+            x: canvas.width && logicalWidth ? canvas.width / logicalWidth : 1,
+            y: canvas.height && logicalHeight ? canvas.height / logicalHeight : 1
         };
         const rows = this.prepareRows(dataView, renderCtx, pixelRatio, requestDraw);
         if (!rows) {
             gridMap.drawnIndex = null;
-            return;
+            return null;
         }
         this.clear(canvasCtx, renderCtx);
 
@@ -672,8 +696,8 @@ class CanvasRenderer {
             canvas.width > 0 && canvas.height > 0 && canvas.width * canvas.height * 4 <= 16 * 1024 * 1024 &&
             Math.min(pxW * pixelRatio.x, pxH * pixelRatio.y) <= 2 && colorPalette.every(color => (color >>> 24) === 255) &&
             rows.length * Math.ceil(pxW * pixelRatio.x) * Math.ceil(pxH * pixelRatio.y) <= canvas.width * canvas.height * 4;
-        if (raster && this.rectRenderer instanceof RectRendererWebGL) this.rectRenderer.beginRasterMode(canvas, 0xff231e1c);
-        else this.rectRenderer.beginRawMode(canvas, scaleYVal);
+        if (raster && this.rectRenderer instanceof RectRendererWebGL) this.rectRenderer.beginRasterMode(canvas, 0xff231e1c, logicalWidth, logicalHeight);
+        else this.rectRenderer.beginRawMode(canvas, scaleYVal, logicalWidth, logicalHeight);
 
         for (const i of rows) {
             const yVal = dataView.getY(i);
@@ -704,6 +728,14 @@ class CanvasRenderer {
         }
         this.rectRenderer.endRawMode();
 
+        if (options?.axes !== false) this.drawAxes(canvasCtx, dataView, renderCtx);
+        return rows;
+    }
+
+    drawAxes(canvasCtx: CanvasRenderingContext2D, dataView: DataView, renderCtx: RendererContext): void {
+        const { width, height, offsetX, offsetY } = renderCtx;
+        const plotWidth = Math.max(0, width - this.MARGIN_LEFT_), plotHeight = Math.max(0, height - this.MARGIN_BOTTOM_);
+        const scaleXVal = scaleX(renderCtx.scaleXLog), scaleYVal = scaleY(renderCtx.scaleYLog);
         // Axes
         canvasCtx.strokeStyle = '#eee';
         canvasCtx.lineWidth = 1;

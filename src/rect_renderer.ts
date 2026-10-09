@@ -1,6 +1,9 @@
 /// <reference lib="dom" />
 // 上記がないと，なぜか worker と解釈されてしまう
 
+// タイル原点の減算で生じる微小誤差を半画素境界で吸収し、描画位置と集約を揃える。
+function pixelEdge(value: number): number { return Math.ceil(value - 0.5 - 1e-9); }
+
 class RectRendererWebGL {
 
     // DOM/CSS 次元
@@ -71,13 +74,13 @@ class RectRendererWebGL {
 
     // 不透明な細い点は画素へ直接描き、GL描画後のCanvas間転送を避ける。
     // 適用条件と画像サイズの上限はCanvasRendererが判定する。
-    beginRasterMode(canvas: HTMLCanvasElement, background: number): void {
+    beginRasterMode(canvas: HTMLCanvasElement, background: number, width = canvas.clientWidth, height = canvas.clientHeight): void {
         const ctx = canvas.getContext("2d");
         if (!ctx) throw new Error("2D rendering context could not be obtained.");
         this.ctx2d_ = ctx;
         this.imageWidthDOM_ = canvas.width; this.imageHeightDOM_ = canvas.height;
-        this.imageWidthScale_ = canvas.width / Math.max(1, canvas.clientWidth);
-        this.imageHeightScale_ = canvas.height / Math.max(1, canvas.clientHeight);
+        this.imageWidthScale_ = canvas.width / Math.max(1, width);
+        this.imageHeightScale_ = canvas.height / Math.max(1, height);
         if (!this.rasterImage_ || this.rasterImage_.width !== canvas.width || this.rasterImage_.height !== canvas.height) {
             this.rasterImage_ = ctx.createImageData(canvas.width, canvas.height);
             this.rasterPixels_ = new Uint32Array(this.rasterImage_.data.buffer);
@@ -88,7 +91,7 @@ class RectRendererWebGL {
     }
 
     // beginRawMode でキャンバスを受け取り、必要なら WebGL2 を初期化
-    beginRawMode(canvas: HTMLCanvasElement, scale: number): void {
+    beginRawMode(canvas: HTMLCanvasElement, scale: number, width = canvas.clientWidth, height = canvas.clientHeight): void {
         // 2D を確保
         const ctx2d = canvas.getContext("2d");
         if (!ctx2d) throw new Error("2D rendering context could not be obtained.");
@@ -97,10 +100,10 @@ class RectRendererWebGL {
         // DOM/CSS サイズ・スケール更新
         this.imageHeightDOM_ = canvas.height;
         this.imageWidthDOM_ = canvas.width;
-        this.imageHeightCSS_ = canvas.clientHeight;
-        this.imageWidthCSS_ = canvas.clientWidth;
-        this.imageWidthScale_ = canvas.width / Math.max(1, canvas.clientWidth);
-        this.imageHeightScale_ = canvas.height / Math.max(1, canvas.clientHeight);
+        this.imageHeightCSS_ = height;
+        this.imageWidthCSS_ = width;
+        this.imageWidthScale_ = canvas.width / Math.max(1, width);
+        this.imageHeightScale_ = canvas.height / Math.max(1, height);
 
         // オフスクリーンと WebGL2 準備（初回のみ作成）
         if (!this.overlayCanvas_) {
@@ -160,10 +163,10 @@ class RectRendererWebGL {
     fillRect(cssLeft: number, cssTop: number, cssWidth: number, cssHeight: number, packed: number): void {
         if (this.rasterMode_) {
             // 画素中心が矩形内にある範囲を使い、表示準備の被覆判定と揃える。
-            const x0 = Math.max(0, Math.ceil(cssLeft * this.imageWidthScale_ - 0.5));
-            const x1 = Math.min(this.imageWidthDOM_, Math.ceil((cssLeft + cssWidth) * this.imageWidthScale_ - 0.5));
-            const y0 = Math.max(0, Math.ceil(cssTop * this.imageHeightScale_ - 0.5));
-            const y1 = Math.min(this.imageHeightDOM_, Math.ceil((cssTop + cssHeight) * this.imageHeightScale_ - 0.5));
+            const x0 = Math.max(0, pixelEdge(cssLeft * this.imageWidthScale_));
+            const x1 = Math.min(this.imageWidthDOM_, pixelEdge((cssLeft + cssWidth) * this.imageWidthScale_));
+            const y0 = Math.max(0, pixelEdge(cssTop * this.imageHeightScale_));
+            const y1 = Math.min(this.imageHeightDOM_, pixelEdge((cssTop + cssHeight) * this.imageHeightScale_));
             if (x0 >= x1) return;
             for (let y = y0; y < y1; y++) this.rasterPixels_!.fill(packed, y * this.imageWidthDOM_ + x0, y * this.imageWidthDOM_ + x1);
             return;
@@ -190,10 +193,10 @@ class RectRendererWebGL {
         const wDOM = this.imageWidthDOM_;
         const hDOM = this.imageHeightDOM_;
 
-        const x0 = Math.max(0, Math.ceil(cssLeft * sx - 0.5));
-        const y0 = Math.max(0, Math.ceil(cssTop * sy - 0.5));
-        const x1 = Math.min(wDOM, Math.ceil((cssLeft + cssWidth) * sx - 0.5));
-        const y1 = Math.min(hDOM, Math.ceil((cssTop + cssHeight) * sy - 0.5));
+        const x0 = Math.max(0, pixelEdge(cssLeft * sx));
+        const y0 = Math.max(0, pixelEdge(cssTop * sy));
+        const x1 = Math.min(wDOM, pixelEdge((cssLeft + cssWidth) * sx));
+        const y1 = Math.min(hDOM, pixelEdge((cssTop + cssHeight) * sy));
         if (x1 <= x0 || y1 <= y0) return;
 
         if (this.count_ >= this.cap_) this.grow_();
@@ -370,12 +373,12 @@ class RectRendererSoft {
         return true;
     }
 
-    beginRawMode(canvas: HTMLCanvasElement, scale: number): void {
+    beginRawMode(canvas: HTMLCanvasElement, scale: number, width = canvas.clientWidth, height = canvas.clientHeight): void {
         // 画像サイズ（DOM/CSS）
         this.imageHeightDOM_ = canvas.height;
         this.imageWidthDOM_  = canvas.width;
-        this.imageHeightCSS_ = canvas.clientHeight;
-        this.imageWidthCSS_  = canvas.clientWidth;
+        this.imageHeightCSS_ = height;
+        this.imageWidthCSS_  = width;
 
         const ctx = canvas.getContext("2d");
         if (!ctx) {
@@ -383,8 +386,8 @@ class RectRendererSoft {
         }
         this.ctx_ = ctx;
 
-        this.imageWidthScale_  = canvas.width  / Math.max(1, canvas.clientWidth);
-        this.imageHeightScale_ = canvas.height / Math.max(1, canvas.clientHeight);
+        this.imageWidthScale_  = canvas.width  / Math.max(1, width);
+        this.imageHeightScale_ = canvas.height / Math.max(1, height);
 
         if (!this.overlayCanvas_) {
             return;
@@ -507,4 +510,4 @@ class RectRendererSoft {
     }
 }
 
-export { RectRendererSoft, RectRendererWebGL };
+export { RectRendererSoft, RectRendererWebGL, pixelEdge };

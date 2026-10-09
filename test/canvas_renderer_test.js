@@ -14,7 +14,12 @@ require.extensions[".ts"] = (module, filename) => {
 const { Loader } = require("../src/loader.ts");
 const { inferViewDefinition } = require("../src/data_view.ts");
 const { CanvasRenderer, GridMap, INITIAL_RENDERER_CONTEXT } = require("../src/canvas_renderer.ts");
-const { RectRendererWebGL } = require("../src/rect_renderer.ts");
+const { TiledCanvasRenderer } = require("../src/tiled_canvas_renderer.ts");
+const { RectRendererSoft, RectRendererWebGL, pixelEdge } = require("../src/rect_renderer.ts");
+const { Settings } = require("../src/settings.ts");
+// 設定のStore testではWorkerを起動しない。圧縮読み込みは実browserで確認する。
+require.cache[require.resolve("../src/zstd_worker.ts")] = { exports: { default: null } };
+const { default: Store, ACTION, CHANGE } = require("../src/store.ts");
 
 function load(csv, definition) {
     const loader = new Loader();
@@ -529,4 +534,220 @@ test("Direct raster is limited to small opaque indexed points and bounded image 
     assert.equal(batches, 3, "The raster image must stay within 16 MiB");
     assert.equal(raster, 1);
     loader.reset();
+});
+
+function tileEnvironment() {
+    const { renderer } = makeRenderer(), previousWindow = global.window, previousDocument = global.document;
+    const tiledRenderer = new TiledCanvasRenderer(renderer);
+    const frames = new Map(), timers = new Map(), canvases = [];
+    let nextId = 0, fills = 0;
+    function makeCanvas(width = 0, height = 0, clientWidth = 0, clientHeight = 0) {
+        const canvas = { width, height, clientWidth, clientHeight };
+        const ctx = { canvas, save() {}, restore() {}, resetTransform() {}, setTransform() {}, drawImage() {},
+            fillRect() {}, beginPath() {}, moveTo() {}, lineTo() {}, stroke() {}, fillText() {} };
+        canvas.getContext = () => ctx;
+        canvases.push(canvas);
+        return canvas;
+    }
+    global.document = { createElement: () => makeCanvas() };
+    global.window = {
+        requestAnimationFrame(fn) { const id = ++nextId; frames.set(id, fn); return id; },
+        cancelAnimationFrame(id) { frames.delete(id); },
+        setTimeout(fn) { const id = ++nextId; timers.set(id, fn); return id; },
+        clearTimeout(id) { timers.delete(id); }
+    };
+    renderer.rectRenderer.fillRect = () => fills++;
+    return {
+        renderer, tiledRenderer, canvas: makeCanvas(690, 340, 690, 340), frames, timers, canvases, get fills() { return fills; },
+        drain() {
+            let iterations = 0;
+            while (frames.size || timers.size) {
+                assert.ok(iterations++ < 500, "Tile generation must finish without a busy loop");
+                const queue = frames.size ? frames : timers, [id, fn] = queue.entries().next().value;
+                queue.delete(id); fn();
+            }
+        },
+        restore() {
+            tiledRenderer.clear();
+            renderer.cancelPendingRows();
+            global.window = previousWindow; global.document = previousDocument;
+        }
+    };
+}
+
+test("Pixel boundaries remain stable under tile translation and floating-point roundoff", () => {
+    for (const edge of [-1, 0, 608]) for (const shift of [-256, 0, 256, 512]) for (const error of [-2e-12, 0, 2e-12]) {
+        assert.equal(pixelEdge(edge + 0.5 + error - shift) + shift, edge);
+    }
+    assert.equal(pixelEdge(608.50001), 609);
+    assert.equal(pixelEdge(608.49999), 608);
+});
+
+test("Software rendering retains direct compositing when tiles are enabled", () => {
+    const { loader, view } = load(gridCSV), env = tileEnvironment(), { renderer, tiledRenderer, canvas } = env;
+    Object.setPrototypeOf(renderer.rectRenderer, RectRendererSoft.prototype);
+    try {
+        tiledRenderer.draw(canvas, new GridMap(), view, { ...INITIAL_RENDERER_CONTEXT, width: 690, height: 340 },
+            () => { throw new Error("Software rendering must not queue tile updates"); }, { tiled: true });
+        assert.ok(env.fills);
+        assert.equal(tiledRenderer.tiles_.size, 0);
+        assert.equal(env.frames.size, 0);
+    } finally { env.restore(); loader.reset(); }
+});
+
+test("A tile working set above the memory budget falls back without regenerating forever", () => {
+    const { loader, view } = load(gridCSV), env = tileEnvironment(), { renderer, tiledRenderer, canvas } = env;
+    const context = { ...INITIAL_RENDERER_CONTEXT, width: 690, height: 340 };
+    let builds = 0;
+    tiledRenderer.tileBuilder_ = new CanvasRenderer(renderer.rectRenderer);
+    // 実際に巨大配列を確保せず、予算超過のpayloadを与えてfallbackを確認する。
+    tiledRenderer.tileBuilder_.draw = () => {
+        builds++;
+        return { length: 1, byteLength: 64 * 1024 * 1024 + 4 };
+    };
+    const paint = () => tiledRenderer.draw(canvas, new GridMap(), view, context, () => window.requestAnimationFrame(paint), { tiled: true });
+    try {
+        paint(); env.drain();
+        assert.ok(tiledRenderer.tileBypass_);
+        assert.equal(tiledRenderer.tiles_.size, 0);
+        assert.equal(tiledRenderer.tileBytes_, 0);
+        paint(); env.drain();
+        assert.equal(builds, 1, "The same oversized working set must use direct rendering thereafter");
+    } finally { env.restore(); loader.reset(); }
+});
+
+test("Tiles reuse integer pans and previous zoom levels without rerunning row selection", () => {
+    const { loader, view } = load(gridCSV), env = tileEnvironment(), grid = new GridMap();
+    const { renderer, tiledRenderer, canvas } = env;
+    let context = { ...INITIAL_RENDERER_CONTEXT, width: 690, height: 340, scaleXLog: Math.log(10), scaleYLog: Math.log(10) };
+    const paint = () => tiledRenderer.draw(canvas, grid, view, context, () => window.requestAnimationFrame(paint), { tiled: true });
+    try {
+        paint(); env.drain();
+        assert.ok(tiledRenderer.tiles_.size > 0);
+        assert.equal(tiledRenderer.tileBuilder_.rectRenderer, renderer.rectRenderer, "Tiles must share the existing backend");
+        assert.ok(grid.drawnIndex.some(row => row >= 0), "Completed tiles must keep hover records");
+        const fills = env.fills, select = renderer.selectRows, childSelect = tiledRenderer.tileBuilder_.selectRows;
+        renderer.selectRows = tiledRenderer.tileBuilder_.selectRows = () => { throw new Error("Cached tiles must avoid selection"); };
+        context = { ...context, offsetX: 8, offsetY: 4 };
+        paint(); env.drain();
+        assert.equal(env.fills, fills, "A prefetched pan must only blit existing images");
+        tiledRenderer.tileBuilder_.selectRows = childSelect;
+        const original = context;
+        context = { ...context, scaleXLog: Math.log(20), scaleYLog: Math.log(20) };
+        paint();
+        assert.equal(env.timers.size, 1, "Zoom must defer new tiles while displaying the previous scale");
+        assert.equal(grid.drawnIndex, null, "Provisional images must not expose stale hover records");
+        env.drain();
+        const zoomFills = env.fills;
+        tiledRenderer.tileBuilder_.selectRows = () => { throw new Error("Returning to a cached scale must reuse tiles"); };
+        context = original;
+        paint(); env.drain();
+        assert.equal(env.fills, zoomFills);
+        renderer.selectRows = select;
+        let selections = 0;
+        renderer.selectRows = function*(...args) { selections++; return yield* select.apply(this, args); };
+        context = { ...context, offsetX: 40000, offsetY: 40000 };
+        paint();
+        assert.ok(selections > 0, "A distant jump must use direct rendering instead of a blank provisional image");
+    } finally { env.restore(); loader.reset(); }
+});
+
+test("Disabling tiles cancels queued work, releases images and restores direct drawing", () => {
+    const { loader, view } = load(gridCSV), env = tileEnvironment();
+    const { renderer, tiledRenderer, canvas } = env, context = { ...INITIAL_RENDERER_CONTEXT, width: 690, height: 340 };
+    const paint = () => tiledRenderer.draw(canvas, new GridMap(), view, context, () => window.requestAnimationFrame(paint), { tiled: true });
+    try {
+        paint(); env.drain();
+        const retained = Array.from(tiledRenderer.tiles_.values()).flatMap(tile => tile.canvas ? [tile.canvas] : []);
+        assert.ok(retained.length);
+        paint();
+        tiledRenderer.draw(canvas, new GridMap(), view, context, () => { throw new Error("Disabled tiles must not schedule updates"); }, { tiled: false });
+        assert.equal(tiledRenderer.tileBytes_, 0);
+        assert.equal(tiledRenderer.tiles_.size, 0);
+        assert.equal(env.frames.size, 0); assert.equal(env.timers.size, 0);
+        assert.ok(retained.every(image => image.width === 1));
+        assert.ok(renderer.rowCache_);
+        paint();
+        assert.ok(env.frames.size, "Enabling tiles must start a fresh generation");
+        tiledRenderer.draw(canvas, new GridMap(), view, context, undefined, { tiled: false });
+        assert.equal(env.frames.size, 0);
+    } finally { env.restore(); loader.reset(); }
+});
+
+test("Disabling tiles cancels asynchronous preparation without publishing stale images", async () => {
+    const csv = "category,time\n" + Array.from({ length: 120003 }, (_, i) => `${i % 3},${i % 60001}`).join("\n");
+    const { loader, view } = load(csv, { view: { axisXField: "category", axisYField: "time" }, columns: {} });
+    await loader.axisIndexes.waitForIdle();
+    const env = tileEnvironment(), { renderer, tiledRenderer, canvas } = env;
+    const context = renderer.fitScaleToData(view, { ...INITIAL_RENDERER_CONTEXT, width: 690, height: 340 });
+    tiledRenderer.tileBuilder_ = new CanvasRenderer(renderer.rectRenderer);
+    tiledRenderer.tileBuilder_.exactOverview = () => null;
+    let updates = 0;
+    try {
+        tiledRenderer.draw(canvas, new GridMap(), view, context, () => updates++, { tiled: true });
+        const [id, frame] = env.frames.entries().next().value;
+        env.frames.delete(id); frame();
+        assert.ok(tiledRenderer.tileBuilder_.pendingRows_, "Large tile preparation must yield");
+        const image = tiledRenderer.tilePending_.canvas;
+        tiledRenderer.draw(canvas, new GridMap(), view, context, undefined, { tiled: false });
+        await new Promise(resolve => setTimeout(resolve, 10));
+        assert.equal(updates, 0);
+        assert.equal(tiledRenderer.tileBuilder_.pendingRows_, null);
+        assert.equal(tiledRenderer.tiles_.size, 0);
+        assert.equal(image.width, 1);
+        assert.equal(env.frames.size, 0);
+    } finally { env.restore(); loader.reset(); }
+});
+
+test("Tile LRU bounds memory and invalidates data, point size and display scale changes", () => {
+    const csv = "x,y\n" + Array.from({ length: 1024 }, (_, i) => `${i % 32 * 256 + 30},${Math.floor(i / 32) * 256 + 30}`).join("\n");
+    const { loader, view } = load(csv, { view: { axisXField: "x", axisYField: "y" }, columns: {} }), env = tileEnvironment();
+    const { renderer, tiledRenderer, canvas } = env;
+    let context = { ...INITIAL_RENDERER_CONTEXT, width: 690, height: 340, scaleXLog: 0, scaleYLog: 0 }, currentView = view;
+    const paint = () => tiledRenderer.draw(canvas, new GridMap(), currentView, context, () => window.requestAnimationFrame(paint), { tiled: true });
+    try {
+        for (let i = 0; i < 40; i++) {
+            context = { ...context, offsetX: i % 8 * 1024, offsetY: Math.floor(i / 8) * 1024 };
+            paint(); env.drain();
+            assert.ok(tiledRenderer.tileBytes_ <= 64 * 1024 * 1024);
+            assert.ok(tiledRenderer.tiles_.size <= 256);
+        }
+        assert.ok(env.canvases.some(image => image.width === 1), "Evicted canvas backing stores must be released");
+        for (const change of [
+            () => { context = { ...context, minPlotWidth: 3 }; },
+            () => { canvas.width *= 2; canvas.height *= 2; },
+            () => { currentView = loader.GetDataView({ view: { axisXField: "y", axisYField: "x" }, columns: {} }); }
+        ]) {
+            const old = Array.from(tiledRenderer.tiles_.values());
+            change(); paint();
+            assert.equal(tiledRenderer.tiles_.size, 0, "A changed rendering definition must discard completed tiles");
+            assert.ok(old.every(tile => !tile.canvas || tile.canvas.width === 1));
+            env.drain();
+        }
+    } finally { env.restore(); loader.reset(); }
+});
+
+test("Tiled rendering defaults on and restores only valid persisted booleans", () => {
+    const previous = global.localStorage;
+    try {
+        for (const stored of [null, {}, { tiledRenderingEnabled: false }, { tiledRenderingEnabled: true }, { tiledRenderingEnabled: "false" }]) {
+            global.localStorage = { getItem() { return stored === null ? null : JSON.stringify(stored); } };
+            const settings = new Settings(); settings.load();
+            assert.equal(settings.tiledRenderingEnabled, stored?.tiledRenderingEnabled === false ? false : true);
+        }
+        let saved = JSON.stringify({ tiledRenderingEnabled: false });
+        global.localStorage = { getItem() { return saved; }, setItem(_key, value) { saved = value; } };
+        const store = new Store();
+        assert.equal(store.state.tiledRenderingEnabled, false);
+        let changes = 0, redraws = 0;
+        store.on(CHANGE.COMPATIBILITY_CHANGED, () => changes++);
+        store.on(CHANGE.CONTENT_UPDATED, () => redraws++);
+        store.trigger(ACTION.SET_TILED_RENDERING, true);
+        assert.equal(store.state.tiledRenderingEnabled, true);
+        assert.equal(JSON.parse(saved).tiledRenderingEnabled, true);
+        store.trigger(ACTION.SET_TILED_RENDERING, true);
+        store.trigger(ACTION.SET_TILED_RENDERING, "false");
+        assert.equal(changes, 1); assert.equal(redraws, 1);
+        assert.equal(new Store().state.tiledRenderingEnabled, true);
+    } finally { global.localStorage = previous; }
 });

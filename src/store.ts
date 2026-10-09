@@ -25,6 +25,7 @@ enum ACTION {
     SETTINGS_SAVE_REQUEST,  // 設定保存リクエスト
     UPDATE_RENDERER_CONTEXT,    // RendererContext の更新
     SHOW_COLOR_LEGEND,         // カラーレジェンドの表示/非表示
+    SET_TILED_RENDERING,
     ACTION_END, // 末尾
 };
 
@@ -50,6 +51,7 @@ enum CHANGE {
     LOG_CLEARED,
     LOG_OVERLAY_VISIBILITY_CHANGED, // payload: boolean
     AXIS_INDEX_PROGRESS,     // payload: number | null
+    COMPATIBILITY_CHANGED,
 };
 
 type StoreState = Readonly<{
@@ -58,6 +60,7 @@ type StoreState = Readonly<{
     showSettings: boolean;          // 設定パネルの表示フラグ
     showDebugOverlay: boolean;      // デバッグオーバーレイの表示フラグ
     logs: readonly string[];        // ログの配列
+    tiledRenderingEnabled: boolean;
 }>;
 
 // 初期値
@@ -67,6 +70,7 @@ const INITIAL_STORE_STATE: StoreState = {
     showSettings: true,
     showDebugOverlay: false,
     logs: [],
+    tiledRenderingEnabled: true,
 } as const;
 
 class Store {
@@ -104,6 +108,7 @@ class Store {
 
     constructor() {
         this.settings.load();
+        this.patchState({ tiledRenderingEnabled: this.settings.tiledRenderingEnabled });
         this.loader = new Loader();
         this.loader.onViewUpdated = () => this.trigger(CHANGE.CONTENT_UPDATED);
         this.loader.axisIndexes.onProgress = progress => this.trigger(CHANGE.AXIS_INDEX_PROGRESS, progress);
@@ -205,6 +210,15 @@ class Store {
         this.on(ACTION.UPDATE_RENDERER_CONTEXT, (renderCtx: RendererContext) => {
             if (renderCtx === this.state_.renderCtx) return; // 変更なし最適化
             this.patchState({ renderCtx });
+            this.trigger(CHANGE.CONTENT_UPDATED);
+        });
+
+        this.on(ACTION.SET_TILED_RENDERING, (enabled: boolean) => {
+            if (typeof enabled !== "boolean" || enabled === this.state_.tiledRenderingEnabled) return;
+            this.settings.tiledRenderingEnabled = enabled;
+            this.settings.save();
+            this.patchState({ tiledRenderingEnabled: enabled });
+            this.trigger(CHANGE.COMPATIBILITY_CHANGED);
             this.trigger(CHANGE.CONTENT_UPDATED);
         });
 

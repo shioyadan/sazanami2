@@ -64,6 +64,9 @@ Zstandard-compressed files (`.zst`) can be opened directly.
 - **Fit:** Fit the whole dataset into the canvas.
 - **Legend:** Show or hide the color legend.
 - **Log:** Review loading warnings and other messages.
+- **Compatibility:** `Settings > Compatibility > Tiled rendering` reuses rendered plot tiles while
+  panning and zooming. It is on by default; turn it off to use direct rendering. The choice is saved
+  in this browser. Software rendering automatically uses direct rendering.
 - **Canvas:** Drag with the left mouse button to pan. Use Ctrl/Command+mouse wheel to zoom, or
   Shift+mouse wheel to zoom horizontally. Touch input supports pinching and swiping.
 
@@ -73,6 +76,7 @@ view definitions for matching column headers between browser sessions.
 Indexes for the active axes are built on demand within a memory budget. Index construction and
 large-view preparation run incrementally so you can continue interacting with the app. WebGL
 overview rendering combines points covering the same pixels and retains the last row's color.
+Tile rendering aligns panning to physical pixels to keep cached images sharp.
 
 ### Load data from a server
 
