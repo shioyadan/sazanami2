@@ -59,12 +59,14 @@ Zstandard-compressed files (`.zst`) can be opened directly.
 
 ### View controls
 
-- **Settings:** Drag columns onto the X, Y, and Color slots. Add a derived column to compute values
-  from an expression using up to two input columns.
+- **Open:** Open a local CSV, TSV, or Zstandard-compressed file.
+- **View:** Open or close the settings panel. Drag columns onto the X, Y, and Color slots.
+  Add a derived column to compute values from an expression using up to two input columns.
 - **Fit:** Fit the whole dataset into the canvas.
 - **Legend:** Show or hide the color legend.
 - **Log:** Review loading warnings and other messages.
-- **Compatibility:** `Settings > Compatibility > Tiled rendering` reuses rendered plot tiles while
+- **Menu:** Open the application log, keyboard shortcuts, or version information.
+- **Compatibility:** `View > Compatibility > Tiled rendering` reuses rendered plot tiles while
   panning and zooming. It is on by default; turn it off to use direct rendering. The choice is saved
   in this browser. Software rendering automatically uses direct rendering.
 - **Canvas:** Drag with the left mouse button to pan. Use Ctrl/Command+mouse wheel to zoom, or

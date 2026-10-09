@@ -1,114 +1,124 @@
 import React, { useRef, useEffect, useState } from "react";
 import Store, { ACTION, CHANGE } from "./store";
-import ViewDefinitionEditor from "./view_definition_editor";
-
-
 import { fileOpen } from "browser-fs-access";
-import { Nav, Navbar, NavDropdown, Accordion, Modal } from "react-bootstrap";
-import { INITIAL_RENDERER_CONTEXT } from "./canvas_renderer";
+import { Dropdown, Modal } from "react-bootstrap";
 
 // react-icons 経由でアイコンをインポートすると，webpack でのビルド時に必要なアイコンのみがバンドルされる
-import { BsList, BsX, BsArrowsFullscreen, BsJournalText, BsTrash, BsPalette } from 'react-icons/bs';
+import {
+    BsList, BsX, BsArrowsFullscreen, BsJournalText, BsTrash, BsPalette,
+    BsFolder2Open, BsSliders, BsKeyboard, BsInfoCircle
+} from "react-icons/bs";
 
-const ToolBar = (props: {store: Store;}) => {
-    let store = props.store;
-    const [logCount, setLogCount] = useState(0);
+const ToolBar = ({ store }: { store: Store }) => {
+    const [logCount, setLogCount] = useState(store.state.logs.length);
+    const [showSettings, setShowSettings] = useState(store.state.showSettings);
+    const [showLog, setShowLog] = useState(store.state.showDebugOverlay);
+    const [showLegend, setShowLegend] = useState(false);
 
     const openFile = async () => {
-         try {
-            // ファイルを読み込む
+        try {
             const file = await fileOpen();
             store.trigger(ACTION.FILE_LOAD_FROM_FILE_OBJECT, file);
-         }
-         catch (error) {
-            store.trigger(ACTION.LOG_ADD, "Error opening file:" + error);
-         }
-        // console.log(contents); // ファイル内容を表示
-    };
-
-    // メニューアイテムの選択時の処理
-    const dispatch = (selectedKey: string|null, event: React.SyntheticEvent<unknown>) => {
-        event.preventDefault();    // ページ遷移を防ぐ
-        switch (selectedKey) {
-        case "menu_version":  store.trigger(ACTION.DIALOG_VERSION_OPEN); break;
-        case "menu_load": openFile(); break;
-        case "menu_keyboard_shortcuts": store.trigger(ACTION.DIALOG_HELP_OPEN); break;
-        case "menu_settings": store.trigger(ACTION.SHOW_SETTINGS, !store.state.showSettings); break;
-        case "menu_fit": store.trigger(ACTION.CANVAS_FIT); break;
-        case "menu_debug_overlay_toggle": store.trigger(ACTION.SHOW_LOG_OVERLAY, !store.state.showDebugOverlay); break;
-        case "menu_legend_toggle": store.trigger(ACTION.SHOW_COLOR_LEGEND); break;
+        } catch (error) {
+            if (error instanceof Error && error.name === "AbortError") return;
+            store.trigger(ACTION.LOG_ADD, "Error opening file: " + error);
         }
-        setSelectedKey(0);
     };
-    const [selectedKey, setSelectedKey] = useState(0);
 
-    useEffect(() => { // マウント時
-        const onAdded = () => setLogCount(c => c + 1);
-        const onCleared = () => setLogCount(0);
-        store.on(CHANGE.LOG_ADDED, onAdded);
-        store.on(CHANGE.LOG_CLEARED, onCleared);
+    useEffect(() => {
+        const onLogsChanged = () => setLogCount(store.state.logs.length);
+        const onSettings = (show: boolean) => setShowSettings(show);
+        const onLog = (show: boolean) => setShowLog(show);
+        // 凡例はStoreの状態を持たないため、ColorLegendと同じ表示操作を購読する。
+        const onLegend = (show?: boolean) => setShowLegend(current => typeof show === "boolean" ? show : !current);
+        store.on(CHANGE.LOG_ADDED, onLogsChanged);
+        store.on(CHANGE.LOG_CLEARED, onLogsChanged);
+        store.on(CHANGE.SHOW_SETTINGS, onSettings);
+        store.on(CHANGE.LOG_OVERLAY_VISIBILITY_CHANGED, onLog);
+        store.on(ACTION.SHOW_COLOR_LEGEND, onLegend);
         return () => {
-            store.off(CHANGE.LOG_ADDED, onAdded);
-            store.off(CHANGE.LOG_CLEARED, onCleared);
+            store.off(CHANGE.LOG_ADDED, onLogsChanged);
+            store.off(CHANGE.LOG_CLEARED, onLogsChanged);
+            store.off(CHANGE.SHOW_SETTINGS, onSettings);
+            store.off(CHANGE.LOG_OVERLAY_VISIBILITY_CHANGED, onLog);
+            store.off(ACTION.SHOW_COLOR_LEGEND, onLegend);
         };
-    }, []);
+    }, [store]);
 
     return (
-        <Navbar expand={true} 
-            variant="dark"
-            style={{ backgroundColor: "#272a31"}}
-        >
-            <Navbar.Toggle aria-controls="responsive-navbar-nav" />
-            <Navbar.Collapse id="responsive-navbar-nav">
-            <Nav onSelect={dispatch} activeKey={selectedKey}>
-                <NavDropdown menuVariant="dark" title={<BsList size={16}/>} id="collapsible-nav-dropdown">
-                    <NavDropdown.Item eventKey="menu_load">
-                        Load file
-                    </NavDropdown.Item>
-                    <NavDropdown.Item eventKey="menu_settings">
-                        Settings
-                    </NavDropdown.Item>
-                    <NavDropdown.Item eventKey="menu_keyboard_shortcuts">
-                        Keyboard shortcuts
-                    </NavDropdown.Item>
-                    <NavDropdown.Divider />
-                    <NavDropdown.Item eventKey="menu_version">
-                        Version information
-                    </NavDropdown.Item>
-                </NavDropdown>
-            </Nav>
-            <Nav onSelect={dispatch} activeKey={selectedKey}
-                style={{ color: "#C9CACB" }} className="me-auto" // このクラスでリンクが左側に配置される
+        <header className="app-toolbar" aria-label="Application toolbar">
+            <button
+                className="toolbar-action toolbar-primary" type="button"
+                aria-label="Open file" title="Open file"
+                onClick={() => void openFile()}
             >
-                <Nav.Link className="nav-link tool-bar-link" eventKey="menu_fit">
-                    <BsArrowsFullscreen size={14} /> Fit
-                </Nav.Link>
-                <Nav.Link
-                    className="nav-link tool-bar-link"
-                    eventKey="menu_legend_toggle"
-                    title="Show/Hide legend"
+                <BsFolder2Open aria-hidden="true" />
+                <span className="toolbar-label">Open</span>
+            </button>
+            <button
+                className="toolbar-action" type="button"
+                aria-label="Fit data to canvas" title="Fit data to canvas"
+                onClick={() => store.trigger(ACTION.CANVAS_FIT)}
+            >
+                <BsArrowsFullscreen aria-hidden="true" />
+                <span className="toolbar-label">Fit</span>
+            </button>
+            <button
+                className="toolbar-action" type="button"
+                aria-label="View settings" title="View settings" aria-pressed={showSettings}
+                onClick={() => store.trigger(ACTION.SHOW_SETTINGS, !store.state.showSettings)}
+            >
+                <BsSliders aria-hidden="true" />
+                <span className="toolbar-label">View</span>
+            </button>
+            <button
+                className="toolbar-action" type="button"
+                aria-label="Color legend" title="Show or hide color legend" aria-pressed={showLegend}
+                onClick={() => store.trigger(ACTION.SHOW_COLOR_LEGEND)}
+            >
+                <BsPalette aria-hidden="true" />
+                <span className="toolbar-label">Legend</span>
+            </button>
+            <button
+                className="toolbar-action" type="button"
+                aria-label="Application log" aria-pressed={showLog}
+                title={logCount === 0 ? "Application log" : `Application log: ${logCount} messages`}
+                onClick={() => store.trigger(ACTION.SHOW_LOG_OVERLAY, !store.state.showDebugOverlay)}
+            >
+                <BsJournalText aria-hidden="true" />
+                <span className="toolbar-label">Log</span>
+                {logCount > 0 && (
+                    <span className="toolbar-log-count" aria-label={`${logCount} log messages`}>
+                        {logCount > 99 ? "99+" : logCount}
+                    </span>
+                )}
+            </button>
+            <div className="toolbar-spacer" />
+            <Dropdown className="application-menu" focusFirstItemOnShow="keyboard">
+                <Dropdown.Toggle
+                    id="application-menu" variant="" className="toolbar-action"
+                    aria-label="Application menu" title="Application menu"
                 >
-                    <BsPalette size={14} /> Legend
-                </Nav.Link>
-                <Nav.Link
-                    className="nav-link tool-bar-link"
-                    eventKey="menu_debug_overlay_toggle"
-                    title={logCount === 0 ? "No logs yet" : `${logCount} logs`}
+                    <BsList aria-hidden="true" />
+                    <span className="toolbar-label">Menu</span>
+                </Dropdown.Toggle>
+                <Dropdown.Menu
+                    align="end" className="application-menu-panel" variant="dark"
+                    popperConfig={{ modifiers: [{ name: "offset", options: { offset: [0, 8] } }] }}
                 >
-                    <BsJournalText size={14} />{" "}
-                    {logCount > 0 ? `Log (${logCount})` : "Log"}
-                </Nav.Link>
-                {
-                /*
-                <Nav.Link className="nav-link tool-bar-link" eventKey="zoom-in">
-                    <i className="bi bi-zoom-in"></i> Zoom In                
-                </Nav.Link>
-                <Nav.Link className="nav-link tool-bar-link" eventKey="zoom-out">
-                    <i className="bi bi-zoom-out"></i> Zoom Out                
-                </Nav.Link> */}
-            </Nav>
-            </Navbar.Collapse>
-        </Navbar>
+                    <Dropdown.Item as="button" onClick={() => store.trigger(ACTION.SHOW_LOG_OVERLAY, true)}>
+                        <BsJournalText aria-hidden="true" /> Application log
+                    </Dropdown.Item>
+                    <Dropdown.Item as="button" onClick={() => store.trigger(ACTION.DIALOG_HELP_OPEN)}>
+                        <BsKeyboard aria-hidden="true" /> Keyboard shortcuts
+                    </Dropdown.Item>
+                    <Dropdown.Divider />
+                    <Dropdown.Item as="button" onClick={() => store.trigger(ACTION.DIALOG_VERSION_OPEN)}>
+                        <BsInfoCircle aria-hidden="true" /> Version information
+                    </Dropdown.Item>
+                </Dropdown.Menu>
+            </Dropdown>
+        </header>
     );
 };
 
