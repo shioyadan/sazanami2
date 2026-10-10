@@ -25,6 +25,7 @@ class TiledCanvasRenderer {
     private tileTimer_: number | null = null;
     private tileGeneration_ = 0;
     private tilePrefetchDisabled_ = false;
+    private tilePrefetchRange_ = "";
     private tileFading_ = false;
     private tileBypass_: { view: DataView; key: string } | null = null;
     private previousPlot_: { canvas: HTMLCanvasElement; context: RendererContext } | null = null;
@@ -55,7 +56,7 @@ class TiledCanvasRenderer {
         this.tileView_ = null; this.tileContentKey_ = "";
         this.tileLayer_ = this.tileFallback_ = null;
         this.tileRequest_ = null;
-        this.tilePrefetchDisabled_ = false; this.tileBypass_ = null;
+        this.tilePrefetchDisabled_ = false; this.tilePrefetchRange_ = ""; this.tileBypass_ = null;
     }
 
     draw(canvas: HTMLCanvasElement, gridMap: GridMap, dataView: DataView | null, context: RendererContext,
@@ -97,8 +98,13 @@ class TiledCanvasRenderer {
         const left = Math.floor((c.offsetX * r.x - layer.phaseX) / size), top = Math.floor((c.offsetY * r.y - layer.phaseY) / size);
         const right = Math.ceil(((c.offsetX + c.width - this.renderer_.MARGIN_LEFT_) * r.x - layer.phaseX) / size) - 1;
         const bottom = Math.ceil(((c.offsetY + c.height - this.renderer_.MARGIN_BOTTOM_) * r.y - layer.phaseY) / size) - 1;
+        // 外周1枚だけでは広い画面の縮小に足りない。各辺にplotの半幅・半高さを備え、
+        // 中央で1/2へ縮小する時や端での1段階zoomに旧倍率の画像を再利用する。
+        // 可視tileを先に作り、先読みの保持量は既存の64MiB・256項目で制限する。
+        const marginX = Math.max(1, Math.ceil((c.width - this.renderer_.MARGIN_LEFT_) * r.x / (2 * size)));
+        const marginY = Math.max(1, Math.ceil((c.height - this.renderer_.MARGIN_BOTTOM_) * r.y / (2 * size)));
         const jobs: TileJob[] = [];
-        for (let y = top - 1; y <= bottom + 1; y++) for (let x = left - 1; x <= right + 1; x++) {
+        for (let y = top - marginY; y <= bottom + marginY; y++) for (let x = left - marginX; x <= right + marginX; x++) {
             const visible = x >= left && x <= right && y >= top && y <= bottom;
             jobs.push({ key: `${layer.key}|${x},${y}`, x, y, visible,
                 priority: (visible ? 0 : 1e6) + (x - (left + right) / 2) ** 2 + (y - (top + bottom) / 2) ** 2 });
@@ -131,9 +137,19 @@ class TiledCanvasRenderer {
         const request: TileRequest = { view, context, ratio, layer: this.tileLayer_, requestDraw };
         this.tileRequest_ = request;
         const positions = this.tilePositions(request), visible = positions.filter(job => job.visible);
+        const prefetchRange = `${positions[0].key}|${positions[positions.length - 1].key}`;
+        // 同じ範囲での予算超過は再試行しない。pan・resizeで対象が変われば先読みを再開する。
+        if (this.tilePrefetchRange_ !== prefetchRange) {
+            this.tilePrefetchRange_ = prefetchRange; this.tilePrefetchDisabled_ = false;
+        }
         this.tileJobs_ = positions.filter(job => (job.visible || !this.tilePrefetchDisabled_) && !this.tiles_.has(job.key)).sort((a, b) => a.priority - b.priority);
-        if (this.tilePending_ && !this.tileJobs_.some(job => job.key === this.tilePending_!.job.key)) {
-            this.tileBuilder_?.cancelPendingRows(); this.tilePending_.canvas.width = 1; this.tilePending_ = null;
+        if (this.tilePending_) {
+            const next = this.tileJobs_.find(job => job.key === this.tilePending_!.job.key);
+            // panで可視範囲が変わったら先読みの準備を中断して可視tileへ譲る。
+            // 準備中のtile自体が可視になった場合は同じ座標の結果を引き継ぐ。
+            if (!next || (!next.visible && this.tileJobs_.some(job => job.visible))) {
+                this.tileBuilder_?.cancelPendingRows(); this.tilePending_.canvas.width = 1; this.tilePending_ = null;
+            } else this.tilePending_.job = next;
         }
         const now = performance.now();
         this.tileFading_ = visible.some(job => {
@@ -309,7 +325,9 @@ class TiledCanvasRenderer {
             const tile: PlotTile = { layer: request.layer, x: job.x, y: job.y, canvas, rows,
                 bytes: (canvas ? size * size * 4 : 128) + rows.byteLength,
                 readyAt: job.visible && this.tileFallback_ && this.tileFallback_ !== request.layer && this.renderer_.rectRenderer instanceof RectRendererWebGL ? performance.now() : undefined };
-            const visibleKeys = new Set(this.tilePositions(request).filter(position => position.visible).map(position => position.key));
+            const positions = this.tilePositions(request);
+            const visibleKeys = new Set(positions.filter(position => position.visible).map(position => position.key));
+            const wantedKeys = new Set(positions.map(position => position.key));
             let visibleBytes = 0;
             for (const [key, cached] of this.tiles_) if (visibleKeys.has(key)) visibleBytes += cached.bytes;
             if (visibleBytes + tile.bytes > TiledCanvasRenderer.TILE_BUDGET) {
@@ -329,8 +347,11 @@ class TiledCanvasRenderer {
             this.tilePending_ = null; builder.releasePreparedRows();
             this.tileJobs_ = this.tileJobs_.filter(next => next.key !== job.key);
             while (this.tileBytes_ > TiledCanvasRenderer.TILE_BUDGET || this.tiles_.size > 256) {
-                const oldest = Array.from(this.tiles_.entries()).find(([key]) => !visibleKeys.has(key)) ?? this.tiles_.entries().next().value!;
-                if (!visibleKeys.has(job.key) && oldest[1].layer === request.layer) {
+                // 同倍率でも以前の画面の外周は先に解放する。必要な外周を追い出した時だけ
+                // 先読みを止め、広げた範囲の生成と追い出しが循環するのを防ぐ。
+                const entries = Array.from(this.tiles_.entries());
+                const oldest = entries.find(([key]) => !wantedKeys.has(key)) ?? entries.find(([key]) => !visibleKeys.has(key)) ?? entries[0];
+                if (!visibleKeys.has(job.key) && wantedKeys.has(oldest[0])) {
                     this.tilePrefetchDisabled_ = true;
                     this.tileJobs_ = this.tileJobs_.filter(next => next.visible);
                 }

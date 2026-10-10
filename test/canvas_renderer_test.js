@@ -779,6 +779,119 @@ test("Rapid zooms keep the last complete layer instead of an incomplete intermed
     } finally { env.restore(); loader.reset(); }
 });
 
+test("Prefetched tiles cover a centered half-scale zoom and an edge wheel step at fractional DPR", () => {
+    const { loader, view } = load(gridCSV);
+    try {
+        for (const dpr of [1, 1.25, 2]) {
+            const env = tileEnvironment(), { renderer, tiledRenderer, canvas } = env;
+            canvas.clientWidth = 1280; canvas.clientHeight = 768;
+            canvas.width = 1280 * dpr; canvas.height = 768 * dpr;
+            let context = { ...INITIAL_RENDERER_CONTEXT, width: 1280, height: 768,
+                offsetX: 2048.37, offsetY: 2048.53 };
+            const paint = () => tiledRenderer.draw(canvas, new GridMap(), view, context, () => {}, { tiled: true });
+            try {
+                paint(); env.drain(); paint();
+                const original = context, layer = tiledRenderer.tileLayer_, before = env.fills;
+                const centerX = (renderer.MARGIN_LEFT_ + context.width) / 2;
+                const centerY = (context.height - renderer.MARGIN_BOTTOM_) / 2;
+                for (const [factorX, factorY, x, y] of [
+                    [0.5, 0.5, centerX, centerY], [0.5, 1, centerX, centerY],
+                    [1 / 1.3, 1 / 1.3, renderer.MARGIN_LEFT_, 0],
+                    [1 / 1.3, 1 / 1.3, context.width, context.height - renderer.MARGIN_BOTTOM_]
+                ]) {
+                    context = renderer.applyZoom(original, x, y, {
+                        x: original.scaleXLog + Math.log(factorX), y: original.scaleYLog + Math.log(factorY)
+                    });
+                    paint();
+                    const request = tiledRenderer.tileRequest_, bounds = Array.from(tiledRenderer.tiles_.values())
+                        .filter(tile => tile.layer === layer).map(tile => tiledRenderer.tileBounds(tile, request));
+                    assert.ok(Math.min(...bounds.map(b => b[0])) <= renderer.MARGIN_LEFT_ * dpr);
+                    assert.ok(Math.min(...bounds.map(b => b[1])) <= 0);
+                    assert.ok(Math.max(...bounds.map(b => b[2])) >= canvas.width,
+                        "Old tiles must already cover the newly exposed right edge");
+                    assert.ok(Math.max(...bounds.map(b => b[3])) >= (context.height - renderer.MARGIN_BOTTOM_) * dpr);
+                    assert.equal(env.fills, before, "Zoom must reuse completed outer tiles before new generation starts");
+                    assert.ok(env.timers.size, "The new scale must still wait until zoom settles");
+                }
+            } finally { env.restore(); }
+        }
+    } finally { loader.reset(); }
+});
+
+test("Missing visible tiles preempt pending outer preparation and reuse promoted jobs", () => {
+    const { loader, view } = load(gridCSV), env = tileEnvironment(), { renderer, tiledRenderer, canvas } = env;
+    let context = { ...INITIAL_RENDERER_CONTEXT, width: 690, height: 340 };
+    const paint = () => tiledRenderer.draw(canvas, new GridMap(), view, context, () => {}, { tiled: true });
+    try {
+        paint();
+        const outer = tiledRenderer.tileJobs_.find(job => !job.visible && job.x === 3 && job.y === 0);
+        const image = document.createElement("canvas"); image.width = image.height = 256;
+        tiledRenderer.tilePending_ = { job: outer, canvas: image, context };
+        tiledRenderer.tileBuilder_ = new CanvasRenderer(renderer.rectRenderer);
+        let cancellations = 0;
+        tiledRenderer.tileBuilder_.cancelPendingRows = () => cancellations++;
+        paint();
+        assert.equal(tiledRenderer.tilePending_, null, "Offscreen preparation must yield to missing visible tiles");
+        assert.equal(image.width, 1);
+        assert.equal(cancellations, 1);
+        const promoted = document.createElement("canvas"); promoted.width = promoted.height = 256;
+        tiledRenderer.tilePending_ = { job: outer, canvas: promoted, context };
+        context = { ...context, offsetX: 256 };
+        paint();
+        assert.equal(tiledRenderer.tilePending_.canvas, promoted, "A tile that became visible must keep its preparation");
+        assert.equal(tiledRenderer.tilePending_.job.visible, true);
+        assert.equal(cancellations, 1);
+    } finally { env.restore(); loader.reset(); }
+});
+
+test("Expanded prefetch stops at its budget while keeping every visible tile", () => {
+    const { loader, view } = load(gridCSV), env = tileEnvironment(), { renderer, tiledRenderer, canvas } = env;
+    const context = { ...INITIAL_RENDERER_CONTEXT, width: 690, height: 340 };
+    tiledRenderer.tileBuilder_ = new CanvasRenderer(renderer.rectRenderer);
+    tiledRenderer.tileBuilder_.draw = () => {
+        const rows = Uint32Array.of(0);
+        Object.defineProperty(rows, "byteLength", { value: 6 * 1024 * 1024 });
+        return rows;
+    };
+    const paint = () => tiledRenderer.draw(canvas, new GridMap(), view, context, () => window.requestAnimationFrame(paint), { tiled: true });
+    try {
+        paint(); env.drain();
+        assert.equal(tiledRenderer.tileBypass_, null);
+        assert.equal(tiledRenderer.tilePrefetchDisabled_, true);
+        assert.ok(tiledRenderer.tileBytes_ <= 64 * 1024 * 1024);
+        assert.ok(tiledRenderer.tilePositions(tiledRenderer.tileRequest_).filter(job => job.visible)
+            .every(job => tiledRenderer.tiles_.has(job.key)));
+        assert.equal(tiledRenderer.tileJobs_.length, 0);
+        paint();
+        assert.equal(tiledRenderer.tileJobs_.length, 0, "An unchanged range must not restart budget-limited prefetch");
+        context.offsetX = 256;
+        paint();
+        assert.equal(tiledRenderer.tilePrefetchDisabled_, false, "Moving into a different tile range must retry prefetch");
+        env.drain();
+        assert.ok(tiledRenderer.tileBytes_ <= 64 * 1024 * 1024);
+    } finally { env.restore(); loader.reset(); }
+});
+
+test("Expanded prefetch evicts obsolete tiles before dropping the current outer range", () => {
+    const { loader, view } = load(gridCSV), env = tileEnvironment(), { renderer, tiledRenderer, canvas } = env;
+    canvas.clientWidth = canvas.width = 1280; canvas.clientHeight = canvas.height = 768;
+    let context = { ...INITIAL_RENDERER_CONTEXT, width: 1280, height: 768 };
+    tiledRenderer.tileBuilder_ = new CanvasRenderer(renderer.rectRenderer);
+    tiledRenderer.tileBuilder_.draw = () => Uint32Array.of(0);
+    const paint = () => tiledRenderer.draw(canvas, new GridMap(), view, context, () => window.requestAnimationFrame(paint), { tiled: true });
+    try {
+        for (let i = 0; i < 5; i++) {
+            context = { ...context, offsetX: i * 4096 };
+            paint(); env.drain();
+            assert.equal(tiledRenderer.tilePrefetchDisabled_, false);
+            assert.ok(tiledRenderer.tilePositions(tiledRenderer.tileRequest_).every(job => tiledRenderer.tiles_.has(job.key)),
+                "A fitting outer range must finish even after older positions fill the cache");
+            assert.ok(tiledRenderer.tileBytes_ <= 64 * 1024 * 1024);
+            assert.ok(tiledRenderer.tiles_.size <= 256);
+        }
+    } finally { env.restore(); loader.reset(); }
+});
+
 test("Zoom reuses the latest complete pan with smoothing and keeps final tiles sharp", () => {
     const { loader, view } = load(gridCSV), env = tileEnvironment(), { tiledRenderer, canvas } = env;
     let context = { ...INITIAL_RENDERER_CONTEXT, width: 690, height: 340, scaleXLog: Math.log(10), scaleYLog: Math.log(10) };
