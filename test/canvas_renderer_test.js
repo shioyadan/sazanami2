@@ -739,7 +739,7 @@ test("Tiles reuse integer pans and previous zoom levels without rerunning row se
         const original = context;
         context = { ...context, scaleXLog: Math.log(20), scaleYLog: Math.log(20) };
         paint();
-        assert.equal(env.timers.size, 1, "Zoom must defer new tiles while displaying the previous scale");
+        assert.equal(env.timers.size, 1, "Zoom must defer the exact final scale while preparing stable scales");
         assert.equal(grid.drawnIndex, null, "Provisional images must not expose stale hover records");
         env.drain();
         const zoomFills = env.fills;
@@ -768,6 +768,7 @@ test("Rapid zooms keep the last complete layer instead of an incomplete intermed
         paint();
         const [timerId, timer] = env.timers.entries().next().value;
         env.timers.delete(timerId); timer();
+        paint();
         const [frameId, frame] = env.frames.entries().next().value;
         env.frames.delete(frameId); frame();
         const intermediate = tiledRenderer.tileLayer_;
@@ -912,7 +913,7 @@ test("Zoom reuses the latest complete pan with smoothing and keeps final tiles s
             "Thin source pixels must survive provisional downscaling");
         assert.equal(copies.at(-1).image, tiledRenderer.previousPlot_.canvas,
             "Resampled tile edges must not overwrite the complete viewport image");
-        env.drain(); copies.length = 0; paint();
+        env.drain(); paint(); env.drain(); copies.length = 0; paint();
         assert.ok(copies.length);
         assert.ok(copies.every(copy => !copy.smooth), "Completed tiles must use sharp integer blits");
     } finally { env.restore(); loader.reset(); }
@@ -945,12 +946,12 @@ test("Zoom tiles fade over the complete image and cancel the transition when dis
     const paint = () => tiledRenderer.draw(canvas, grid, view, context, () => {}, { tiled: true });
     try {
         paint(); env.drain(); paint();
-        const completed = tiledRenderer.tileFallback_;
         context = { ...context, scaleXLog: Math.log(11), scaleYLog: Math.log(11) };
-        paint(); env.drain(); copies.length = 0; paint();
+        paint(); env.drain(); paint(); env.drain(); copies.length = 0; paint();
+        const completed = tiledRenderer.tileFallback_;
         const images = new Set(Array.from(tiledRenderer.tiles_.values()).filter(tile => tile.layer === tiledRenderer.tileLayer_).map(tile => tile.canvas));
         assert.ok(copies.some(copy => images.has(copy.image) && copy.alpha === 0));
-        assert.equal(tiledRenderer.tileFallback_, completed);
+        assert.notEqual(completed, tiledRenderer.tileLayer_);
         assert.equal(grid.drawnIndex, null);
         now += 60; copies.length = 0; paint();
         assert.ok(copies.some(copy => images.has(copy.image) && copy.alpha === 0.5));
@@ -959,16 +960,204 @@ test("Zoom tiles fade over the complete image and cancel the transition when dis
         context = { ...context, scaleXLog: Math.log(12) }; paint();
         assert.equal(tiledRenderer.tileFallback_, completed);
         context = zoom; paint();
-        now += 60; copies.length = 0; paint();
+        now += 120; copies.length = 0; paint();
         assert.ok(copies.some(copy => images.has(copy.image) && copy.alpha === 1));
         assert.equal(tiledRenderer.tileFallback_, tiledRenderer.tileLayer_);
         assert.ok(grid.drawnIndex);
-        context = { ...context, scaleXLog: Math.log(13) }; paint(); env.drain(); paint();
+        context = { ...context, scaleXLog: Math.log(13) }; paint(); env.drain(); paint(); env.drain(); paint();
         assert.equal(tiledRenderer.tileFading_, true);
         tiledRenderer.draw(canvas, grid, view, context, () => {}, { tiled: false });
         assert.equal(env.frames.size, 0);
         assert.equal(tiledRenderer.tileFading_, false);
     } finally { global.performance = previousPerformance; env.restore(); loader.reset(); }
+});
+
+// 一様な色のCanvasで画像の継承と合成を確認する。データのrasterは他のtestで検証する。
+function solidTileEnvironment() {
+    const env = tileEnvironment(), previousPerformance = global.performance;
+    let now = 1000;
+    global.performance = { now: () => now };
+    Object.setPrototypeOf(env.renderer.rectRenderer, RectRendererWebGL.prototype);
+    env.renderer.MARGIN_LEFT_ = env.renderer.MARGIN_BOTTOM_ = 0;
+    env.renderer.drawAxes = () => {};
+    const create = rgb => {
+        const canvas = { width: 256, height: 256, clientWidth: 256, clientHeight: 256, rgb: [...rgb] };
+        const stack = [], ctx = { canvas, globalAlpha: 1,
+            save() { stack.push(this.globalAlpha); }, restore() { this.globalAlpha = stack.pop(); },
+            resetTransform() {}, setTransform() {},
+            fillRect() { const s = this.fillStyle.slice(1); this.blend([0, 2, 4].map(i => parseInt(s.slice(i, i + 2), 16))); },
+            drawImage(image) { this.blend(image.rgb); },
+            blend(rgb) { canvas.rgb = rgb.map((value, i) => value * this.globalAlpha + canvas.rgb[i] * (1 - this.globalAlpha)); }
+        };
+        canvas.getContext = () => ctx;
+        return canvas;
+    };
+    global.document = { createElement: () => create([0, 0, 0]) };
+    const context = { ...INITIAL_RENDERER_CONTEXT, width: 256, height: 256, scaleXLog: 0, scaleYLog: 0 };
+    const layer = (x, y = x) => ({ key: env.tiledRenderer.zoomKey(Math.log(x), Math.log(y)), sx: x, sy: y, phaseX: 0, phaseY: 0 });
+    const add = (layer, rgb, x = 0) => {
+        const tile = { layer, x, y: 0, canvas: create(rgb), rows: Uint32Array.of(0), bytes: 256 * 256 * 4 + 4 };
+        env.tiledRenderer.tiles_.set(`${layer.key}|${x},0`, tile); env.tiledRenderer.tileBytes_ += tile.bytes;
+        return tile;
+    };
+    const view = { getX: () => 0, getY: () => 0 };
+    env.tiledRenderer.tileView_ = view; env.tiledRenderer.tileContentKey_ = "1,1,1,1";
+    const blue = layer(1);
+    env.tiledRenderer.tileFallback_ = blue;
+    env.tiledRenderer.previousPlot_ = { canvas: create([0, 0, 255]), context, complete: true };
+    add(blue, [0, 0, 255]);
+    return { ...env, context, view, create, layer, add, advance(ms) { now += ms; },
+        restore() { env.restore(); global.performance = previousPerformance; } };
+}
+
+test("A zoom during a fade continues from the displayed composite", () => {
+    const env = solidTileEnvironment(), { tiledRenderer: tiled, context: fit, view, create, layer, add } = env;
+    const canvas = create([0, 0, 255]), grid = new GridMap(), red = layer(1.1);
+    let context = { ...fit, scaleXLog: Math.log(1.1), scaleYLog: Math.log(1.1) };
+    const paint = () => tiled.draw(canvas, grid, view, context, () => {}, { tiled: true });
+    tiled.tileLayer_ = red; tiled.tileZoomKey_ = red.key; add(red, [255, 0, 0]);
+    try {
+        paint(); env.advance(60); paint();
+        assert.deepEqual(canvas.rgb, [127.5, 0, 127.5]);
+        canvas.width = canvas.clientWidth = 512; context = { ...context, width: 512 }; paint();
+        assert.ok(tiled.tileJobs_.some(job => job.visible));
+        assert.deepEqual(canvas.rgb, [127.5, 0, 127.5], "Newly visible missing tiles must not withdraw an image that is already fading");
+        context = { ...context, scaleXLog: Math.log(1.12), scaleYLog: Math.log(1.12) }; paint();
+        assert.deepEqual(canvas.rgb, [127.5, 0, 127.5], "Changing the zoom must not restore the older blue image");
+        context = { ...context, scaleXLog: Math.log(1.3), scaleYLog: Math.log(1.3) }; paint();
+        assert.deepEqual(canvas.rgb, [127.5, 0, 127.5]);
+        assert.deepEqual(tiled.previousPlot_.canvas.rgb, [127.5, 0, 127.5]);
+        assert.equal(grid.drawnIndex, null);
+    } finally { env.restore(); }
+});
+
+test("Zoom snapshots preserve the plot without the axis overlay", () => {
+    const env = solidTileEnvironment(), { renderer, tiledRenderer: tiled, context: fit, view, create, layer, add } = env;
+    const canvas = create([0, 0, 255]), red = layer(1.1);
+    let context = { ...fit, scaleXLog: Math.log(1.1), scaleYLog: Math.log(1.1) };
+    const paint = () => tiled.draw(canvas, new GridMap(), view, context, () => {}, { tiled: true });
+    tiled.tileLayer_ = red; tiled.tileZoomKey_ = red.key; add(red, [255, 0, 0]);
+    renderer.drawAxes = ctx => { ctx.fillStyle = "#444444"; ctx.fillRect(0, 0, 256, 256); };
+    try {
+        paint(); env.advance(60); paint();
+        assert.deepEqual(canvas.rgb, [68, 68, 68], "The main canvas includes the axis overlay");
+        context = { ...context, scaleXLog: Math.log(1.3), scaleYLog: Math.log(1.3) }; paint();
+        assert.deepEqual(tiled.previousPlot_.canvas.rgb, [127.5, 0, 127.5],
+            "Grid lines must not enter the snapshot and grow over the data on the next zoom");
+    } finally { env.restore(); }
+});
+
+test("Snapshot sources survive eviction until their plot has been captured", () => {
+    const env = solidTileEnvironment(), { tiledRenderer: tiled, context: fit, view, create, layer, add } = env;
+    const canvas = create([0, 0, 255]), red = layer(1.1);
+    let context = { ...fit, scaleXLog: Math.log(1.1), scaleYLog: Math.log(1.1) };
+    const paint = () => tiled.draw(canvas, new GridMap(), view, context, () => {}, { tiled: true });
+    const blue = tiled.tiles_.values().next().value;
+    tiled.tileLayer_ = red; tiled.tileZoomKey_ = red.key; add(red, [255, 0, 0]);
+    tiled.tileBuilder_ = { isPreparingRows: false, draw: () => Uint32Array.of(0), releasePreparedRows() {}, cancelPendingRows() {} };
+    try {
+        paint(); env.advance(60); paint();
+        assert.deepEqual(canvas.rgb, [127.5, 0, 127.5]);
+        assert.ok(tiled.displayedPlot_.sources.has(blue.canvas));
+        const job = tiled.tilePositions(tiled.tileRequest_).find(job => !job.visible);
+        tiled.tileJobs_ = [job]; tiled.tileBytes_ = 64 * 1024 * 1024;
+        tiled.renderTileBatch();
+        assert.equal(blue.canvas.width, 1, "The source tile should actually be evicted");
+        assert.deepEqual(tiled.previousPlot_.canvas.rgb, [127.5, 0, 127.5],
+            "Capture must complete before a source image is released");
+        context = { ...context, scaleXLog: Math.log(1.3), scaleYLog: Math.log(1.3) }; paint();
+        assert.deepEqual(canvas.rgb, [127.5, 0, 127.5]);
+    } finally { env.restore(); }
+});
+
+test("Partially cached layers wait for full coverage and fade from their first display", () => {
+    const env = solidTileEnvironment(), { tiledRenderer: tiled, context: fit, view, create, layer, add } = env;
+    const canvas = create([0, 0, 255]); canvas.width = canvas.clientWidth = 512;
+    const context = { ...fit, width: 512, scaleXLog: Math.log(1.1), scaleYLog: Math.log(1.1) }, red = layer(1.1);
+    tiled.tileLayer_ = red; tiled.tileZoomKey_ = red.key;
+    tiled.previousPlot_.canvas.width = 512; tiled.previousPlot_.context = { ...fit, width: 512 };
+    add(tiled.tileFallback_, [0, 0, 255], 1); add(red, [255, 0, 0]);
+    const copies = [], ctx = canvas.getContext("2d"), draw = ctx.drawImage;
+    ctx.drawImage = function(image, ...args) { copies.push({ image, alpha: this.globalAlpha }); draw.call(this, image, ...args); };
+    const paint = () => tiled.draw(canvas, new GridMap(), view, context, () => {}, { tiled: true });
+    try {
+        env.advance(10000); paint();
+        assert.deepEqual(canvas.rgb, [0, 0, 255], "An old isolated red tile must not pop into view");
+        const tile = add(red, [255, 0, 0], 1);
+        copies.length = 0; paint();
+        assert.ok(copies.some(copy => copy.image === tile.canvas && copy.alpha === 0));
+        env.advance(60); copies.length = 0; paint();
+        assert.ok(copies.filter(copy => copy.image.rgb[0] === 255).every(copy => copy.alpha === 0.5));
+        env.advance(60); paint();
+        assert.equal(tiled.tileFading_, false);
+        assert.equal(tiled.tileFallback_, red);
+        assert.deepEqual(canvas.rgb, [255, 0, 0]);
+    } finally { env.restore(); }
+});
+
+test("Direct fallback and its replacement preserve an interrupted fade", () => {
+    const env = solidTileEnvironment(), { renderer, tiledRenderer: tiled, context: fit, view, create, add } = env;
+    const canvas = create([0, 0, 255]), grid = new GridMap();
+    let context = { ...fit, scaleXLog: Math.log(0.01), scaleYLog: Math.log(0.01) }, ready = false;
+    renderer.draw = (target, _grid, _view, _context, _notify, options) => {
+        assert.notEqual(target, canvas, "The direct fallback must prepare offscreen");
+        assert.equal(options.smoothOverview, true);
+        if (!ready) return null;
+        target.rgb = [255, 0, 0]; return Uint32Array.of(0);
+    };
+    const paint = () => tiled.draw(canvas, grid, view, context, () => {}, { tiled: true });
+    try {
+        tiled.tileZoomKey_ = tiled.zoomKey(0, 0);
+        paint(); assert.deepEqual(canvas.rgb, [0, 0, 255]);
+        assert.equal(tiled.directPlot_.ready, false);
+        tiled.tileSettled_ = true; paint();
+        assert.equal(tiled.tileLayer_.sx, Math.exp(context.scaleXLog));
+        ready = true; paint(); assert.deepEqual(canvas.rgb, [0, 0, 255]);
+        env.advance(60); paint(); assert.deepEqual(canvas.rgb, [127.5, 0, 127.5]);
+        for (const job of tiled.tilePositions(tiled.tileRequest_).filter(job => job.visible)) add(tiled.tileLayer_, [0, 255, 0], job.x);
+        paint(); assert.deepEqual(canvas.rgb, [127.5, 0, 127.5], "Ready tiles must continue the direct fade instead of rolling it back");
+        context = { ...context, scaleXLog: Math.log(0.012), scaleYLog: Math.log(0.012) }; paint();
+        assert.deepEqual(canvas.rgb, [127.5, 0, 127.5]);
+        const saved = tiled.previousPlot_.canvas, scratch = tiled.directCanvas_;
+        tiled.clear(); assert.equal(saved.width, 1); assert.equal(scratch.width, 1);
+    } finally { env.restore(); }
+});
+
+test("Animated zoom shares tile scales and settles at the exact requested scale", () => {
+    const { loader, view } = load(gridCSV), env = tileEnvironment(), { tiledRenderer: tiled, canvas } = env;
+    let context = { ...INITIAL_RENDERER_CONTEXT, width: 690, height: 340, scaleXLog: Math.log(10), scaleYLog: Math.log(10) };
+    const paint = () => tiled.draw(canvas, new GridMap(), view, context, () => window.requestAnimationFrame(paint), { tiled: true });
+    try {
+        paint(); env.drain();
+        const keys = new Set();
+        for (let i = 1; i <= 30; i++) {
+            context = { ...context, scaleXLog: Math.log(10) + 0.14 + i * 0.003, scaleYLog: Math.log(10) + 0.14 + i * 0.003 };
+            paint(); keys.add(tiled.tileLayer_.key);
+        }
+        assert.equal(keys.size, 1, "Small animation steps must not create separate generations");
+        assert.ok(env.frames.size, "Stable scales must build during animation without waiting for the idle timer");
+        env.drain();
+        assert.equal(tiled.tileLayer_.sx, Math.exp(context.scaleXLog));
+        assert.equal(tiled.tileLayer_.sy, Math.exp(context.scaleYLog));
+        const cached = tiled.tileLayer_, fills = env.fills;
+        context = { ...context, scaleXLog: context.scaleXLog + 1e-15, scaleYLog: context.scaleYLog - 1e-15 };
+        paint(); env.drain();
+        assert.equal(tiled.tileLayer_, cached);
+        assert.equal(env.fills, fills, "Floating-point noise must reuse the existing layer");
+        assert.equal(tiled.layerCovers({ ...tiled.tileRequest_, context: { ...context, scaleXLog: -50, scaleYLog: -50 } }, cached), false);
+    } finally { env.restore(); loader.reset(); }
+});
+
+test("Uniform zoom keeps both axes in the same generation at half-step boundaries", () => {
+    const { loader, view } = load(gridCSV), env = tileEnvironment(), { renderer, tiledRenderer: tiled, canvas } = env;
+    let context = { ...INITIAL_RENDERER_CONTEXT, width: 690, height: 340, scaleXLog: 0, scaleYLog: -4.51853764292955 };
+    const start = context, paint = () => tiled.draw(canvas, new GridMap(), view, context, () => {}, { tiled: true });
+    try {
+        paint(); env.drain();
+        for (let i = 0; i < 5; i++) { context = renderer.zoomUniform(context, 200, 120, true, 10); paint(); }
+        const dx = Math.log(tiled.tileLayer_.sx) - start.scaleXLog, dy = Math.log(tiled.tileLayer_.sy) - start.scaleYLog;
+        assert.ok(Math.abs(dx - dy) < 1e-12, "Rounding noise at half a step must not split a uniform zoom into two layers");
+    } finally { env.restore(); loader.reset(); }
 });
 
 test("Disabling tiles cancels queued work, releases images and restores direct drawing", () => {
