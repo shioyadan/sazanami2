@@ -1,4 +1,4 @@
-import React, { useRef, useEffect, createContext, useContext } from "react";
+import React, { useRef, useEffect } from "react";
 import Store, { ACTION, CHANGE } from "./store";
 import { CanvasRenderer, RendererContext, GridMap, scaleX, scaleY } from "./canvas_renderer";
 import { TiledCanvasRenderer } from "./tiled_canvas_renderer";
@@ -563,13 +563,6 @@ const MainCanvas: React.FC<{ store: Store }> = ({ store }) => {
             gridMap.drawnIndex = null;    // ここでクリアしておかないと，描画前にマウスオーバーで参照されてしまう
         };
         const onFileFormatDetected = () => {
-            // 初回表示で範囲外だったらリセット
-            // if (renderCtx.offsetY + renderCtx.height < renderCtx.dataView.getMinY()) {
-            //     renderCtx.offsetY = renderCtx.dataView.getMinY();
-            // }
-            // if (renderCtx.offsetY > renderCtx.dataView.getMaxY()) {
-            //     renderCtx.offsetY = renderCtx.dataView.getMaxY() - renderCtx.height;
-            // }
             if (!store.state.viewDef) {
                 console.log("No view definition after format detected");
                 return;

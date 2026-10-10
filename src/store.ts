@@ -1,6 +1,6 @@
 // store.ts
 import { Loader } from "./loader";
-import { ViewDefinition, DataView, inferViewDefinition, createDataView, INITIAL_VIEW_DEFINITION } from "./data_view";
+import { ViewDefinition, inferViewDefinition, createDataView, INITIAL_VIEW_DEFINITION } from "./data_view";
 import { Settings } from "./settings";
 import { FileLineReader } from "./file_line_reader";
 import { RendererContext, INITIAL_RENDERER_CONTEXT } from "./canvas_renderer";
@@ -226,7 +226,7 @@ class Store {
         const validateAndTryInit_ = (def: ViewDefinition): boolean => {
             try {
                 // 初期化が通る＝レンダリング可能な定義
-                const dv = createDataView(this.loader, def);
+                createDataView(this.loader, def);
                 return true;
             } catch (e) {
                 let msg = "DataView.init failed:" + e;

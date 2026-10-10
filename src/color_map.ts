@@ -1,4 +1,4 @@
-import { Loader, ColumnBuffer } from "./loader";
+import { Loader } from "./loader";
 
 
 // パレット生成

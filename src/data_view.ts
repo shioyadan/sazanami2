@@ -1,5 +1,5 @@
 // data_view.ts
-import { Loader, ColumnBuffer, columnDec, ColumnType, ColumnInterface  } from "./loader";
+import { Loader, columnDec, ColumnType, ColumnInterface } from "./loader";
 import { buildPaletteByName, inferColorMapName } from "./color_map";
 
 // 軸と色の仕様
@@ -56,10 +56,7 @@ const isEqualViewDefinition = (a: ViewDefinition, b: ViewDefinition): boolean =>
 // 行インデクスを返す仮想カラム
 class IndexColumn implements ColumnInterface {
     stat: { min: number; max: number, deviationFromMax: number };
-    private nRows_: number;
-
     constructor(nRows: number) {
-        this.nRows_ = nRows;
         this.stat = { min: 0, max: Math.max(0, nRows - 1), deviationFromMax: 0 };
     }
 
@@ -88,7 +85,6 @@ class ExpressionProjector {
     private cols_: ColumnInterface[] = [];
     private compiledExp_!: (...args: number[]) => number;
     private fastExp_: ((i: number) => number) | null = null;
-    private numRows_ = 0;
     private min_ = 0;
     private max_ = 0;
     private deviationFromMax_ = 0;
@@ -138,7 +134,6 @@ class ExpressionProjector {
 
     init(resolveColumn: (name: string) => ColumnInterface, expr: string, numRows: number) {
         this.expr_ = expr.trim();
-        this.numRows_ = numRows;
 
         // 変数抽出（最大2）
         this.varNames_ = ExpressionProjector.extractVariables(this.expr_);
@@ -414,26 +409,35 @@ export class DataView {
     // 候補件数が最少の区間を選ぶ。多い側の列挙と共通集合用の一時メモリを省くため。
     // 各候補が両軸の条件を満たすかは描画側で確認するため、区間の長さは正確な対象行数とは限らない。
     getVisibleRows(xMin: number, yMin: number, xMax: number, yMax: number): { order: Uint32Array | null; start: number; end: number } {
+        const ranges = [[this.xCol_, xMin, xMax], [this.yCol_, yMin, yMax]] as const;
         let selection: { order: Uint32Array | null; start: number; end: number } = {
-            order: null, start: this.getStartIdx(xMin, yMin), end: this.getEndIdx(xMax, yMax) + 1
+            order: null, start: 0, end: this.numRows_
         };
-        for (const [column, min, max] of [[this.xCol_, xMin, xMax], [this.yCol_, yMin, yMax]] as const) {
+        // 単調な軸は同じ入力順なので、両軸の区間を先に交差させられる。
+        for (const [column, min, max] of ranges) {
+            if (column.stat.deviationFromMax !== 0) continue;
+            selection.start = Math.max(selection.start, this.boundRow(column, min, false));
+            selection.end = Math.min(selection.end, this.boundRow(column, max, true));
+        }
+        for (const [column, min, max] of ranges) {
             const order = this.loaderRef_.axisIndexes.get(column);
             if (!order) continue;
-            const bound = (target: number, upper: boolean) => {
-                let lo = 0, hi = order.length;
-                while (lo < hi) {
-                    const mid = (lo + hi) >>> 1;
-                    const value = column.getNumber(order[mid]);
-                    if (upper ? value <= target : value < target) lo = mid + 1;
-                    else hi = mid;
-                }
-                return lo;
-            };
-            const start = bound(min, false), end = bound(max, true);
+            const start = this.boundRow(column, min, false, order), end = this.boundRow(column, max, true, order);
             if (end - start < selection.end - selection.start) selection = { order, start, end };
         }
         return selection;
+    }
+
+    // 入力順と軸索引の両方で使う二分探索。上端は同じ値の行をすべて含めた次の位置。
+    private boundRow(column: ColumnInterface, target: number, upper: boolean, order: Uint32Array | null = null): number {
+        let lo = 0, hi = order?.length ?? this.numRows_;
+        while (lo < hi) {
+            const mid = Math.floor((lo + hi) / 2);
+            const value = column.getNumber(order ? order[mid] : mid);
+            if (upper ? value <= target : value < target) lo = mid + 1;
+            else hi = mid;
+        }
+        return lo;
     }
 
     xToString(val: number) { return this.xType_.toString(val); }
@@ -464,71 +468,6 @@ export class DataView {
     // パレット（uint32 RGBA packed）の取得
     getPalette(): Uint32Array {
         return this.palettePacked_;
-    }
-
-    // 2分探索
-    lowerBound_(col: ColumnInterface, target: number): number {
-        let lo = 0;
-        let hi = this.numRows_;
-        while (lo < hi) {
-            const mid = Math.floor((lo + hi) / 2);
-            if (col.getNumber(mid) < target) lo = mid + 1;
-            else hi = mid;
-        }
-        return lo;
-    }
-
-    // targetと同じ値の行もすべて含め、その次の位置を返す。
-    upperBound_(col: ColumnInterface, target: number): number {
-        let lo = 0;
-        let hi = this.numRows_;
-        while (lo < hi) {
-            const mid = Math.floor((lo + hi) / 2);
-            if (col.getNumber(mid) <= target) lo = mid + 1;
-            else hi = mid;
-        }
-        return lo;
-    }
-
-    getStartIdx(xStart: number, yStart: number): number {
-        const xDeviationZero = this.xCol_.stat.deviationFromMax === 0;
-        const yDeviationZero = this.yCol_.stat.deviationFromMax === 0;
-
-        const xIndexStart = xDeviationZero ? this.lowerBound_(this.xCol_, xStart) : 0;
-        const yIndexStart = yDeviationZero ? this.lowerBound_(this.yCol_, yStart) : 0;
-
-        if (xDeviationZero && yDeviationZero) {
-            return Math.max(xIndexStart, yIndexStart);
-        }
-        if (xDeviationZero) {
-            return xIndexStart;
-        }
-        if (yDeviationZero) {
-            return yIndexStart;
-        }
-
-        return 0; // 両方に偏差がある場合は全体を走査
-    }
-
-    getEndIdx(xEnd: number, yEnd: number): number {
-        const xDeviationZero = this.xCol_.stat.deviationFromMax === 0;
-        const yDeviationZero = this.yCol_.stat.deviationFromMax === 0;
-
-        // 描画ループは終端を含むため、最後の対象行のindexを返す。
-        const xIndexEnd = xDeviationZero ? this.upperBound_(this.xCol_, xEnd) - 1 : this.numRows_ - 1;
-        const yIndexEnd = yDeviationZero ? this.upperBound_(this.yCol_, yEnd) - 1 : this.numRows_ - 1;
-        
-        if (xDeviationZero && yDeviationZero) {
-            return Math.min(xIndexEnd, yIndexEnd);
-        }
-        if (xDeviationZero) {
-            return xIndexEnd;
-        }
-        if (yDeviationZero) {
-            return yIndexEnd;
-        }
-
-        return this.numRows_ - 1; // 両方に偏差がある場合は全体を走査
     }
 
     getMaxX(): number { return this.xCol_.stat.max; }

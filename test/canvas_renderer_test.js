@@ -124,6 +124,19 @@ test("Fit includes the last column when the sorted cycle column is assigned to X
     assert.equal(rectangles.length, 128);
 });
 
+test("Image-only rendering keeps points and colors without a hover grid", () => {
+    const { loader, view } = load(gridCSV);
+    const { renderer, rectangles, canvas } = makeRenderer();
+    const context = renderer.fitScaleToData(view, { ...INITIAL_RENDERER_CONTEXT, width: 500, height: 340 });
+    const grid = new GridMap();
+    const rows = renderer.draw(canvas, grid, view, context);
+    const expected = rectangles.slice();
+    assert.ok(grid.drawnIndex.some(row => row >= 0));
+    assert.deepEqual(renderer.draw(canvas, null, view, context), rows);
+    assert.deepEqual(rectangles, expected);
+    loader.reset();
+});
+
 test("Fractional panning keeps partially visible cells at all four edges", () => {
     const { loader, view } = load(gridCSV);
     const { renderer, rectangles, canvas } = makeRenderer();
@@ -401,6 +414,24 @@ test("Sorted axes restrict candidates to the intersection of their ranges", () =
     assert.deepEqual(view.getVisibleRows(1, 1, 3, 1), { order: null, start: 2, end: 4 });
     const disjoint = view.getVisibleRows(0, 2, 0, 3);
     assert.ok(disjoint.start >= disjoint.end);
+    loader.reset();
+});
+
+test("Monotonic and indexed ranges keep duplicate boundary values and all matching rows", () => {
+    const { loader, view } = load("x,y\n0,3\n1,0\n1,2\n2,1\n3,2\n4,3", {
+        view: { axisXField: "x", axisYField: "y" }, columns: {}
+    });
+    const [, column] = view.getAxisColumns();
+    const order = Uint32Array.from([1, 3, 2, 4, 0, 5]);
+    loader.axisIndexes.get = candidate => candidate === column ? order : null;
+    for (const [xmin, ymin, xmax, ymax] of [[1, 1, 3, 2], [0, 2, 4, 2], [1, 0, 1, 3], [0, 4, 4, 4]]) {
+        const selection = view.getVisibleRows(xmin, ymin, xmax, ymax);
+        const candidates = Array.from({ length: Math.max(0, selection.end - selection.start) }, (_, i) =>
+            selection.order ? selection.order[selection.start + i] : selection.start + i);
+        const matches = row => view.getX(row) >= xmin && view.getX(row) <= xmax && view.getY(row) >= ymin && view.getY(row) <= ymax;
+        assert.deepEqual(candidates.filter(matches).sort((a, b) => a - b),
+            Array.from({ length: loader.numRows }, (_, row) => row).filter(matches));
+    }
     loader.reset();
 });
 

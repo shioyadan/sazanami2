@@ -1,5 +1,5 @@
-import { FileLineReader, FileLineReaderOptions } from "./file_line_reader";
-import { inferViewDefinition, ViewDefinition, DataView, isEqualViewDefinition, createDataView } from "./data_view";
+import { FileLineReader } from "./file_line_reader";
+import { ViewDefinition, DataView, isEqualViewDefinition, createDataView } from "./data_view";
 import { AxisIndexCache } from "./axis_index";
 
 export const columnDec = {

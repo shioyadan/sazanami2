@@ -1,5 +1,5 @@
 // color_legend.tsx
-import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import Store, { CHANGE, ACTION } from "./store";
 import { columnString } from "./loader";
 

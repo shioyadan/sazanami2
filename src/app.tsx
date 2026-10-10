@@ -14,7 +14,7 @@ const App = () => {
     useEffect(() => { // マウント時
 
         // ページ離脱時に設定保存
-        const onPageHide = (ev: PageTransitionEvent) => {
+        const onPageHide = () => {
             storeRef.current.trigger(ACTION.SETTINGS_SAVE_REQUEST);
         };
         window.addEventListener("pagehide", onPageHide); 

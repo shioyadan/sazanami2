@@ -38,8 +38,7 @@ const scaleY = (scaleYLog: number) => Math.exp(scaleYLog);
 
 
 class GridMap {
-    // 描画されたピクセルのインデックスを保持
-    // マウスオーバー時に使用
+    // マウスオーバー用に、表示範囲の各セルで最後に描いた入力行を保持する。
     drawnIndex: Int32Array | null = null; 
 }
 
@@ -50,7 +49,6 @@ type PreparedRows = { view: DataView; context: RendererContext; pixelRatio: Pixe
 class CanvasRenderer {
     MARGIN_LEFT_ = 50;
     MARGIN_BOTTOM_ = 20;
-    BASE_HEIGHT_ = 1000;
     ZOOM_STEP_LOG_ = Math.log(1.3); // 対数ズーム量
 
     rectRenderer: RectRendererSoft|RectRendererWebGL;
@@ -664,7 +662,8 @@ class CanvasRenderer {
 
 
     // 完成した描画対象を返す。準備が非同期で未完了ならnullを返し、完了時にrequestDrawを呼ぶ。
-    draw(canvas: HTMLCanvasElement, gridMap: GridMap, dataView: DataView | null, renderCtx: RendererContext,
+    // 中間画像だけを作る呼出側はgridMapをnullにし、マウスオーバー用の表を省く。
+    draw(canvas: HTMLCanvasElement, gridMap: GridMap | null, dataView: DataView | null, renderCtx: RendererContext,
         requestDraw?: () => void, options?: { axes?: boolean; aggregateSmallViews?: boolean; smoothOverview?: boolean }): Uint32Array | null {
         const aggregateSmallViews = options?.aggregateSmallViews ?? false;
         if (aggregateSmallViews !== this.aggregateSmallViews_) {
@@ -673,8 +672,6 @@ class CanvasRenderer {
         }
         let canvasCtx = canvas.getContext("2d")!;
         if (!canvasCtx) return null;
-
-        // let startTime = (new Date()).getTime();
 
         const { width, height, offsetX, offsetY } = renderCtx;
         const scaleXVal = scaleX(renderCtx.scaleXLog);
@@ -730,18 +727,17 @@ class CanvasRenderer {
         const pixelRatio = { x: displayRatio.x * samples, y: displayRatio.y * samples };
         const rows = this.prepareRows(dataView, renderCtx, pixelRatio, requestDraw);
         if (!rows) {
-            gridMap.drawnIndex = null;
+            if (gridMap) gridMap.drawnIndex = null;
             return null;
         }
         this.clear(canvasCtx, renderCtx);
 
         // drawnIndex を gridCols × gridRows で初期化
-        if (gridMap.drawnIndex?.length != gridCols * gridRows) {
-            gridMap.drawnIndex = new Int32Array(gridCols * gridRows).fill(-1);
-        }
-        else {
+        if (gridMap) {
+            if (gridMap.drawnIndex?.length !== gridCols * gridRows) gridMap.drawnIndex = new Int32Array(gridCols * gridRows);
             gridMap.drawnIndex.fill(-1);
         }
+        const drawnIndex = gridMap?.drawnIndex;
 
         const gridColRatio = gridCols / visibleCols;
         const gridRowRatio = gridRows / visibleRows;
@@ -771,7 +767,8 @@ class CanvasRenderer {
 
             this.rectRenderer.fillRect(x, y, pxW, pxH, c);
 
-            // visible 範囲内なら、grid 上のセルに記録
+            // 中間画像では表を作らず、最終画面だけにマウスオーバー用の行を記録する。
+            if (!drawnIndex) continue;
             const col = xVal - xStart;
             const row = yVal - yStart;
 
@@ -780,7 +777,7 @@ class CanvasRenderer {
                 const gridCol = Math.floor(col * gridColRatio);
                 const gridRow = Math.floor(row * gridRowRatio);
                 const cellIndex = gridRow * gridCols + gridCol;
-                gridMap.drawnIndex[cellIndex] = i;
+                drawnIndex[cellIndex] = i;
             }
         }
         this.rectRenderer.endRawMode();
@@ -847,9 +844,6 @@ class CanvasRenderer {
             if (x > plotWidth) break;
             canvasCtx.fillText(dataView.xToString(val), x, plotHeight + 3);
         }
-
-        // let elapsedTime = (new Date()).getTime() - startTime;
-        // console.log(`draw() done: ${elapsedTime} ms`);
     };
 
     // マウス位置（CSSピクセル）に対応するデータの文字列を取得
@@ -892,7 +886,6 @@ class CanvasRenderer {
         let payload = "";
         if (recordIndex >= 0) {
             const cols = loader.headers;    // ParsedColumns 型
-            const types = loader.types;     // 各列の型情報
             payload = cols.map((colName) => {
                 const arr = loader.columnFromName(colName);
                 let value = arr.getString(recordIndex);

@@ -1,5 +1,5 @@
 // settings.ts
-import { ViewDefinition, DataView, inferViewDefinition } from "./data_view";
+import { ViewDefinition } from "./data_view";
 
 class Settings { 
     viewDefMapHistory: Record<string, ViewDefinition> = {}; // key: concatenated column names

@@ -1,4 +1,4 @@
-// src/io/getFZSTD_Reader.ts
+// zstd_reader.ts
 import ZstdWorker from "./zstd_worker";
 
 // worker からはチャンクの展開後に postMessage で "progress" が来るので，
@@ -8,6 +8,7 @@ type OutQueueItem = {
     credit: number 
 };
 
+// ファイル名・サイズは将来の展開処理で使えるよう、未使用でも引数として維持する。
 const getFZSTD_Reader = (stream: ReadableStream<Uint8Array>, fileName: string, fileSize: number, updateByteReads: (bytes: number) => void) => {
     const compressedReader = stream.getReader();
     const worker = new ZstdWorker();

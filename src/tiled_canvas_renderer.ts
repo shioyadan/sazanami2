@@ -36,7 +36,7 @@ class TiledCanvasRenderer {
     private displayedPlot_: { context: RendererContext; changed: boolean; complete: boolean;
         paint: (ctx: CanvasRenderingContext2D) => void; sources: Set<HTMLCanvasElement> } | null = null;
     private directCanvas_: HTMLCanvasElement | null = null;
-    private directPlot_: { canvas: HTMLCanvasElement; context: RendererContext; grid: GridMap; ready: boolean; shownAt: number | null } | null = null;
+    private directPlot_: { canvas: HTMLCanvasElement; context: RendererContext; ready: boolean; shownAt: number | null } | null = null;
     private static readonly TILE_SIZE = 256;
     private static readonly TILE_BUDGET = 64 * 1024 * 1024;
     private static readonly TILE_FADE_MS = 120;
@@ -114,12 +114,17 @@ class TiledCanvasRenderer {
         return `${x.toFixed(9)},${y.toFixed(9)}`;
     }
 
-    private layerCovers(request: TileRequest, layer: TileLayer): boolean {
+    private tileRange(request: TileRequest, layer = request.layer) {
         const { context: c, ratio: r } = request, size = TiledCanvasRenderer.TILE_SIZE;
         const sx = layer.sx / scaleX(c.scaleXLog), sy = layer.sy / scaleY(c.scaleYLog);
         const left = Math.floor((c.offsetX * r.x * sx - layer.phaseX) / size), top = Math.floor((c.offsetY * r.y * sy - layer.phaseY) / size);
         const right = Math.ceil(((c.offsetX + c.width - this.renderer_.MARGIN_LEFT_) * r.x * sx - layer.phaseX) / size) - 1;
         const bottom = Math.ceil(((c.offsetY + c.height - this.renderer_.MARGIN_BOTTOM_) * r.y * sy - layer.phaseY) / size) - 1;
+        return { left, top, right, bottom, sx, sy };
+    }
+
+    private layerCovers(request: TileRequest, layer: TileLayer): boolean {
+        const { left, top, right, bottom } = this.tileRange(request, layer);
         // 深い拡大のlayerをFitへ投影すると数億枚にもなる。保持数を超える候補は列挙しない。
         if ((right - left + 1) * (bottom - top + 1) > this.tiles_.size) return false;
         for (let y = top; y <= bottom; y++) for (let x = left; x <= right; x++) if (!this.tiles_.has(`${layer.key}|${x},${y}`)) return false;
@@ -128,10 +133,7 @@ class TiledCanvasRenderer {
 
     private tilePositions(request: TileRequest): TileJob[] {
         const { context: c, ratio: r, layer } = request, size = TiledCanvasRenderer.TILE_SIZE;
-        const sx = layer.sx / scaleX(c.scaleXLog), sy = layer.sy / scaleY(c.scaleYLog);
-        const left = Math.floor((c.offsetX * r.x * sx - layer.phaseX) / size), top = Math.floor((c.offsetY * r.y * sy - layer.phaseY) / size);
-        const right = Math.ceil(((c.offsetX + c.width - this.renderer_.MARGIN_LEFT_) * r.x * sx - layer.phaseX) / size) - 1;
-        const bottom = Math.ceil(((c.offsetY + c.height - this.renderer_.MARGIN_BOTTOM_) * r.y * sy - layer.phaseY) / size) - 1;
+        const { left, top, right, bottom, sx, sy } = this.tileRange(request);
         // 外周1枚だけでは広い画面の縮小に足りない。各辺にplotの半幅・半高さを備え、
         // 中央で1/2へ縮小する時や端での1段階zoomに旧倍率の画像を再利用する。
         // 可視tileを先に作り、先読みの保持量は既存の64MiB・256項目で制限する。
@@ -244,13 +246,13 @@ class TiledCanvasRenderer {
                     image.width = Math.max(1, Math.min(pixels, Math.floor(canvas.width * shrink)));
                     image.height = Math.max(1, Math.min(pixels, Math.floor(canvas.height * shrink)));
                     image.getContext("2d")!.setTransform(image.width / context.width, 0, 0, image.height / context.height, 0, 0);
-                    this.directPlot_ = { canvas: image, context, grid: new GridMap(), ready: false, shownAt: null };
+                    this.directPlot_ = { canvas: image, context, ready: false, shownAt: null };
                 }
             }
         }
         const direct = this.directPlot_;
         if (!ready && direct && !direct.ready) {
-            direct.ready = this.renderer_.draw(direct.canvas, direct.grid, view, direct.context, requestDraw,
+            direct.ready = this.renderer_.draw(direct.canvas, null, view, direct.context, requestDraw,
                 { axes: false, smoothOverview: true }) !== null;
             if (direct.ready) direct.shownAt = now;
         }
@@ -271,7 +273,8 @@ class TiledCanvasRenderer {
             tiles.push(tile);
         }
         const fallback = !complete && this.tileFallback_ && (this.tileFallback_ !== request.layer || this.tileShownAt_ !== null) ?
-            Array.from(this.tiles_.values()).filter(tile => tile.layer === this.tileFallback_).filter(tile => {
+            Array.from(this.tiles_.values()).filter(tile => {
+                    if (tile.layer !== this.tileFallback_) return false;
                     const [x0, y0, x1, y1] = this.tileBounds(tile, request);
                     return x1 > 0 && y1 > 0 && x0 < canvas.width && y0 < canvas.height;
                 }) : [];
@@ -415,6 +418,12 @@ class TiledCanvasRenderer {
         const visibleBatch = this.tileJobs_[0]?.visible;
         const budget = this.tileSettled_ ? (visibleBatch ? 6 : 3) : 2;
         const limit = this.tileSettled_ ? (visibleBatch ? 8 : 4) : 2;
+        // 同じbatch内では表示範囲が変わらない。範囲検索と集合の生成は1回で済ませる。
+        const positions = this.tilePositions(request);
+        const visibleKeys = new Set(positions.filter(position => position.visible).map(position => position.key));
+        const wantedKeys = new Set(positions.map(position => position.key));
+        let visibleBytes = 0;
+        for (const [key, cached] of this.tiles_) if (visibleKeys.has(key)) visibleBytes += cached.bytes;
         let count = 0, changed = false;
         while (count < limit && this.tileJobs_.length) {
             const job = this.tilePending_?.job ?? this.tileJobs_[0];
@@ -431,7 +440,7 @@ class TiledCanvasRenderer {
             }
             const pending = this.tilePending_;
             // タイル内の候補数は画面全体より少ない。同じ画素への重複は小さい範囲でもまとめる。
-            const rows = builder.draw(pending.canvas, new GridMap(), request.view, pending.context, () => {
+            const rows = builder.draw(pending.canvas, null, request.view, pending.context, () => {
                 if (generation === this.tileGeneration_ && this.tilePending_ === pending) this.scheduleTiles();
             }, { axes: false, aggregateSmallViews: true, smoothOverview: true });
             if (rows === null) break;
@@ -439,11 +448,6 @@ class TiledCanvasRenderer {
             if (!canvas) pending.canvas.width = 1;
             const tile: PlotTile = { layer: request.layer, x: job.x, y: job.y, canvas, rows,
                 bytes: (canvas ? size * size * 4 : 128) + rows.byteLength };
-            const positions = this.tilePositions(request);
-            const visibleKeys = new Set(positions.filter(position => position.visible).map(position => position.key));
-            const wantedKeys = new Set(positions.map(position => position.key));
-            let visibleBytes = 0;
-            for (const [key, cached] of this.tiles_) if (visibleKeys.has(key)) visibleBytes += cached.bytes;
             if (visibleBytes + tile.bytes > TiledCanvasRenderer.TILE_BUDGET) {
                 if (canvas) canvas.width = 1;
                 if (visibleKeys.has(job.key)) {
@@ -458,6 +462,7 @@ class TiledCanvasRenderer {
                 break;
             }
             this.tiles_.set(job.key, tile); this.tileBytes_ += tile.bytes;
+            if (visibleKeys.has(job.key)) visibleBytes += tile.bytes;
             this.tilePending_ = null; builder.releasePreparedRows();
             this.tileJobs_ = this.tileJobs_.filter(next => next.key !== job.key);
             while (this.tileBytes_ > TiledCanvasRenderer.TILE_BUDGET || this.tiles_.size > 256) {
@@ -472,6 +477,7 @@ class TiledCanvasRenderer {
                     this.tileJobs_ = this.tileJobs_.filter(next => next.visible);
                 }
                 this.tiles_.delete(oldest[0]); this.tileBytes_ -= oldest[1].bytes;
+                if (visibleKeys.has(oldest[0])) visibleBytes -= oldest[1].bytes;
                 if (oldest[1].canvas) oldest[1].canvas.width = 1;
             }
             changed ||= visibleKeys.has(job.key); count++;

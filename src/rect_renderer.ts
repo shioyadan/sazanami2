@@ -9,8 +9,6 @@ class RectRendererWebGL {
     // DOM/CSS 次元
     private imageHeightDOM_: number = 0;
     private imageWidthDOM_: number = 0;
-    private imageHeightCSS_: number = 0;
-    private imageWidthCSS_: number = 0;
 
     // 2D は合成と細い点の画素描画に使用
     private ctx2d_: CanvasRenderingContext2D | null = null;
@@ -18,10 +16,6 @@ class RectRendererWebGL {
     // CSS→DOM 変換用スケール
     private imageWidthScale_: number = 0;
     private imageHeightScale_: number = 0;
-
-    // 直近状態（2D の状態変更を最小化）
-    private fillStylePrev: string = "";
-    private fillHuePrev: number = -1;
 
     // WebGL2 用オフスクリーン（DOM ピクセルサイズ）
     private overlayCanvas_: HTMLCanvasElement | null = null;
@@ -52,9 +46,6 @@ class RectRendererWebGL {
     private size_: Float32Array = new Float32Array(0);
     private color_: Uint32Array = new Uint32Array(0); // RGBA（各 0..255）
 
-    constructor() {
-    }
-
     init() {
         this.overlayCanvas_ = document.createElement("canvas");
         const gl = this.overlayCanvas_.getContext("webgl2", {
@@ -69,10 +60,6 @@ class RectRendererWebGL {
         this.initGL_();
         return true;
     }
-
-    // 公開 API（clientWidth/Height は 2D が初期化済みの時のみ有効）
-    get clientWidth(): number { return this.ctx2d_?.canvas.clientWidth ?? 0; }
-    get clientHeight(): number { return this.ctx2d_?.canvas.clientHeight ?? 0; }
 
     // 不透明な細い点は画素へ直接描き、GL描画後のCanvas間転送を避ける。
     // 適用条件と画像サイズの上限はCanvasRendererが判定する。
@@ -94,7 +81,7 @@ class RectRendererWebGL {
     }
 
     // beginRawMode でキャンバスを受け取り、必要なら WebGL2 を初期化
-    beginRawMode(canvas: HTMLCanvasElement, scale: number, width = canvas.clientWidth, height = canvas.clientHeight): void {
+    beginRawMode(canvas: HTMLCanvasElement, _scale: number, width = canvas.clientWidth, height = canvas.clientHeight): void {
         // 2D を確保
         const ctx2d = canvas.getContext("2d");
         if (!ctx2d) throw new Error("2D rendering context could not be obtained.");
@@ -103,8 +90,6 @@ class RectRendererWebGL {
         // DOM/CSS サイズ・スケール更新
         this.imageHeightDOM_ = canvas.height;
         this.imageWidthDOM_ = canvas.width;
-        this.imageHeightCSS_ = height;
-        this.imageWidthCSS_ = width;
         this.imageWidthScale_ = canvas.width / Math.max(1, width);
         this.imageHeightScale_ = canvas.height / Math.max(1, height);
 
@@ -372,18 +357,9 @@ class RectRendererSoft {
     private imageWidthScale_: number = 0;
     private imageHeightScale_: number = 0;
 
-    private fillHuePrev_: number = -1;
-    private fillStylePrev_: string = "";
-
     // オーバーレイ（raw描画）用のオフスクリーンキャンバス
     private overlayCanvas_: HTMLCanvasElement | null = null;
     private overlayCtx_: CanvasRenderingContext2D | null = null;
-
-    constructor() {
-        this.ctx_ = null;
-        this.overlayCanvas_ = null;
-        this.overlayCtx_ = null;
-    }
 
     init() {
         // オーバーレイの用意（同サイズ）

@@ -1,7 +1,7 @@
 // view_definition_editor.tsx
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import Store, { ACTION, CHANGE } from "./store";
-import { ViewDefinition, DataView, inferViewDefinition, createDataView } from "./data_view";
+import { ViewDefinition, inferViewDefinition, createDataView } from "./data_view";
 import { columnDec, columnHex, columnString, ColumnType } from "./loader";
 import { Modal, Dropdown } from "react-bootstrap";
 import {
@@ -429,7 +429,7 @@ const strictApply = (store: Store, testDef: ViewDefinition): { ok: boolean; erro
         const def = {...testDef, view: {...testDef.view, colorMap: "" }}; 
 
         // 一度生成して，不正な定義が渡った場合は例外で落ちる
-        const dv = createDataView(store.loader, def);
+        createDataView(store.loader, def);
         const viewDef = store.state.viewDef;
 
         let oldX = viewDef.view.axisXField;
