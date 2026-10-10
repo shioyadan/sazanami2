@@ -20,7 +20,8 @@ const RADIX_HISTOGRAM_BYTES = 1024 * Uint32Array.BYTES_PER_ELEMENT;
 export type OverviewIndex = {
     columns: readonly ColumnInterface[];
     next: Uint32Array;
-    levels: { width: number; height: number; heads: Uint32Array; boundsX: Float64Array | null; boundsY: Float64Array | null }[];
+    // countsは予算内の上位層だけに持たせる。画素用の格子解像度は件数配列のために下げない。
+    levels: { width: number; height: number; heads: Uint32Array; counts: Uint32Array | null; boundsX: Float64Array | null; boundsY: Float64Array | null }[];
     // cellsは領域番号と先頭行(+1)の組。細分後はnextもこの領域ごとのリンクになる。
     fine: { cells: Uint32Array; width: number; height: number; factorX: number; factorY: number } | null;
     exactX: boolean;
@@ -65,14 +66,29 @@ function planOverview(columns: ColumnInterface[], rows: number, budget: number) 
 async function buildOverview(columns: ColumnInterface[], rows: number, plan: NonNullable<ReturnType<typeof planOverview>>, reusable: Uint32Array | null,
     cancelled: () => boolean, onProgress: (progress: number) => void): Promise<OverviewIndex | null> {
     const next = reusable ?? new Uint32Array(rows);
+    const [x, y] = columns;
+    // 既存の細分格子が使うhash表の予算を先に残し、余裕のある上位層から最大4MiBの件数を追加する。
+    const remaining = plan.budget - plan.memoryBytes;
+    const fineBytes = x.buffer instanceof Int32Array && y.buffer instanceof Int32Array && (!plan.exactX || !plan.exactY) ?
+        8 * 2 ** Math.floor(Math.log2(Math.min(remaining / 8, rows / 2, 1048576))) : 0;
+    const countBudget = Math.min(4 * 1024 * 1024, remaining - fineBytes);
+    let countBytes = 0, firstCountLevel = plan.shapes.length;
+    for (let level = plan.shapes.length - 1; level >= 0; level--) {
+        const bytes = plan.shapes[level].width * plan.shapes[level].height * 4;
+        if (countBytes + bytes > countBudget) break;
+        countBytes += bytes; firstCountLevel = level;
+    }
     const makeBounds = (size: number) => {
         const bounds = new Float64Array(size * 2);
         for (let i = 0; i < size; i++) { bounds[i * 2] = Infinity; bounds[i * 2 + 1] = -Infinity; }
         return bounds;
     };
-    const levels = plan.shapes.map(shape => ({ ...shape, heads: new Uint32Array(shape.width * shape.height),
+    const levels = plan.shapes.map((shape, level) => ({ ...shape, heads: new Uint32Array(shape.width * shape.height),
+        counts: level >= firstCountLevel ? new Uint32Array(shape.width * shape.height) : null,
         boundsX: plan.exactX ? null : makeBounds(shape.width), boundsY: plan.exactY ? null : makeBounds(shape.height) }));
-    const [x, y] = columns, base = levels[0], spanX = x.stat.max - x.stat.min, spanY = y.stat.max - y.stat.min;
+    const base = levels[0], countBase = levels[firstCountLevel], spanX = x.stat.max - x.stat.min, spanY = y.stat.max - y.stat.min;
+    const countShiftX = countBase ? Math.log2(base.width / countBase.width) : 0;
+    const countShiftY = countBase ? Math.log2(base.height / countBase.height) : 0;
     let deadline = performance.now() + 6;
     for (let row = 0; row < rows; row++) {
         const xv = x.getNumber(row), yv = y.getNumber(row);
@@ -81,6 +97,9 @@ async function buildOverview(columns: ColumnInterface[], rows: number, plan: Non
             const by = plan.exactY ? yv - y.stat.min : spanY ? Math.min(base.height - 1, Math.floor((yv - y.stat.min) / spanY * base.height)) : 0;
             const cell = by * base.width + bx;
             next[row] = base.heads[cell]; base.heads[cell] = row + 1;
+            if (countBase) {
+                countBase.counts![(by >>> countShiftY) * countBase.width + (bx >>> countShiftX)]++;
+            }
             if (base.boundsX) {
                 base.boundsX[bx * 2] = Math.min(base.boundsX[bx * 2], xv);
                 base.boundsX[bx * 2 + 1] = Math.max(base.boundsX[bx * 2 + 1], xv);
@@ -110,7 +129,7 @@ async function buildOverview(columns: ColumnInterface[], rows: number, plan: Non
             }
         }
         // 共通予算の残りと4N byteの小さい方に制限する。hash表自体も最大8MiB。
-        const available = Math.min(plan.budget - plan.memoryBytes, rows * 4);
+        const available = Math.min(plan.budget - plan.memoryBytes - countBytes, rows * 4);
         const capacity = 2 ** Math.floor(Math.log2(Math.min(available / 8, 1048576)));
         if (occupied && occupied < capacity * 0.7) {
             // keyと先頭行を組にした開番地法。空の細分格子には領域を確保しない。
@@ -211,6 +230,15 @@ async function buildOverview(columns: ColumnInterface[], rows: number, plan: Non
                 if (child.width > parent.width) last = Math.max(last, child.heads[first + child.width + 1]);
             }
             parent.heads[cell] = last;
+            if (parent.counts && child.counts) {
+                let count = child.counts[first];
+                if (child.width > parent.width) count += child.counts[first + 1];
+                if (child.height > parent.height) {
+                    count += child.counts[first + child.width];
+                    if (child.width > parent.width) count += child.counts[first + child.width + 1];
+                }
+                parent.counts[cell] = count;
+            }
             completed++;
             if ((cell & 8191) === 0 && performance.now() >= deadline) {
                 onProgress(0.8 + 0.2 * completed / upperCells);
@@ -226,7 +254,81 @@ async function buildOverview(columns: ColumnInterface[], rows: number, plan: Non
         return count ? span / count : 0;
     };
     return { columns, next, levels, fine, exactX: plan.exactX, exactY: plan.exactY,
-        meanSpanX: meanSpan(base.boundsX), meanSpanY: meanSpan(base.boundsY), memoryBytes: plan.memoryBytes + extraBytes };
+        meanSpanX: meanSpan(base.boundsX), meanSpanY: meanSpan(base.boundsY), memoryBytes: plan.memoryBytes + extraBytes + countBytes };
+}
+
+// 両軸の範囲内の行が少ない場合だけ、全対象行を元の入力順で返す。
+// 完全に含まれる区画は件数だけで判定し、境界だけ座標を調べる。多いと分かった時点や
+// 作業量の上限でnullを返し、計数のための全走査を避けて描画側の既存の集約へ戻す。
+export function* queryOverviewRows(index: OverviewIndex, xMin: number, yMin: number, xMax: number, yMax: number,
+    limit: number, workLimit = 65536): Generator<void, Uint32Array | null> {
+    if (xMin > xMax || yMin > yMax) return new Uint32Array(0);
+    const base = index.levels[0], [x, y] = index.columns, fine = index.fine;
+    const rootLevel = index.levels.length - 1, root = index.levels[rootLevel];
+    const stack: number[] = [], inside: number[] = [], rows: number[] = [];
+    let count = 0, visits = 0;
+    for (let cell = 0; cell < root.heads.length; cell++) if (root.heads[cell]) stack.push(rootLevel, cell);
+    // 計数で保存した区画は、少数と確定してから列挙する。境界で確認済みの行も再利用する。
+    for (let phase = 0; phase < 2; phase++) {
+        const pendingCells = phase ? inside : stack;
+        while (pendingCells.length) {
+            if (++visits > workLimit) return null;
+            if ((visits & 1023) === 0) yield;
+            const cell = pendingCells.pop()!, levelNumber = pendingCells.pop()!, level = index.levels[levelNumber];
+            const bx = cell % level.width, by = Math.floor(cell / level.width);
+            if (!phase) {
+                const ex = base.width / level.width, ey = base.height / level.height;
+                const xmin = level.boundsX ? level.boundsX[bx * 2] : x.stat.min + bx * ex;
+                const xmax = level.boundsX ? level.boundsX[bx * 2 + 1] : Math.min(x.stat.max, x.stat.min + (bx + 1) * ex - 1);
+                const ymin = level.boundsY ? level.boundsY[by * 2] : y.stat.min + by * ey;
+                const ymax = level.boundsY ? level.boundsY[by * 2 + 1] : Math.min(y.stat.max, y.stat.min + (by + 1) * ey - 1);
+                if (xmax < xMin || xmin > xMax || ymax < yMin || ymin > yMax) continue;
+                if (level.counts && xmin >= xMin && xmax <= xMax && ymin >= yMin && ymax <= yMax) {
+                    count += level.counts[cell];
+                    if (count > limit) return null;
+                    inside.push(levelNumber, cell);
+                    continue;
+                }
+            }
+            if (levelNumber > 0) {
+                const child = index.levels[levelNumber - 1], nx = child.width > level.width ? 2 : 1, ny = child.height > level.height ? 2 : 1;
+                for (let dy = 0; dy < ny; dy++) for (let dx = 0; dx < nx; dx++) {
+                    const childCell = (by * ny + dy) * child.width + bx * nx + dx;
+                    if (child.heads[childCell]) pendingCells.push(levelNumber - 1, childCell);
+                }
+                continue;
+            }
+            // 細分後のnextはfineの区画ごとのリンクなので、baseのheadから直接はたどらない。
+            for (let dy = 0; dy < (fine?.factorY ?? 1); dy++) {
+                if (++visits > workLimit) return null;
+                if ((visits & 1023) === 0) yield;
+                const first = fine ? (by * fine.factorY + dy) * fine.width + bx * fine.factorX : 0;
+                const last = fine ? first + fine.factorX : 1;
+                let lo = 0, hi = fine ? fine.cells.length / 2 : 1;
+                if (fine) while (lo < hi) {
+                    if (++visits > workLimit) return null;
+                    if ((visits & 1023) === 0) yield;
+                    const mid = (lo + hi) >>> 1;
+                    if (fine.cells[mid * 2] < first) lo = mid + 1; else hi = mid;
+                }
+                for (let slot = lo; slot < (fine ? fine.cells.length / 2 : 1) && (!fine || fine.cells[slot * 2] < last); slot++) {
+                    let head = fine ? fine.cells[slot * 2 + 1] : level.heads[cell];
+                    while (head) {
+                        if (++visits > workLimit) return null;
+                        if ((visits & 1023) === 0) yield;
+                        const row = head - 1; head = index.next[row];
+                        if (!phase) {
+                            const xv = x.getNumber(row), yv = y.getNumber(row);
+                            if (xv < xMin || xv > xMax || yv < yMin || yv > yMax) continue;
+                            if (++count > limit) return null;
+                        }
+                        rows.push(row);
+                    }
+                }
+            }
+        }
+    }
+    return Uint32Array.from(rows).sort();
 }
 
 function canRadixSort(column: ColumnInterface, rows: number): boolean {

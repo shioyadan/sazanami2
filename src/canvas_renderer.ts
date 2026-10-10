@@ -1,7 +1,7 @@
 // canvas_renderer.ts
 import { Loader, DataView } from "./loader";
 import { RectRendererSoft, RectRendererWebGL, pixelEdge } from "./rect_renderer";
-import { yieldToUI } from "./axis_index";
+import { queryOverviewRows, yieldToUI } from "./axis_index";
 import type { OverviewIndex } from "./axis_index";
 
 /**
@@ -336,19 +336,40 @@ class CanvasRenderer {
         // 同じ画素範囲へ重なる点は、元の入力順で最後の行を残す。
         const aggregate = !(this.rectRenderer instanceof RectRendererSoft) && (this.aggregateSmallViews_ || selection.end - selection.start > 100000) &&
             xBase * xBase * yBase * yBase < Number.MAX_SAFE_INTEGER;
-        const exact = aggregate ? this.exactOverview(view) : null;
+        const overview = view.getOverviewIndex();
+        // 候補件数は片軸だけの上限。両軸で実際に少数なら、領域索引から全対象行を取り出す。
+        // 画面の物理画素数と点の大きさに応じて列挙の上限を決め、判定にも作業量の上限を設ける。
+        const fullRowLimit = Math.max(512, Math.min(32768, Math.floor(width * height * pixelRatio.x * pixelRatio.y /
+            (2 * Math.max(1, pointWidth * pixelRatio.x) * Math.max(1, pointHeight * pixelRatio.y)))));
+        const candidates = selection.end - selection.start;
+        let sparseRows: Uint32Array | null = null;
+        if (overview && overview.index.levels[overview.index.levels.length - 1].counts &&
+            candidates > Math.max(this.aggregateSmallViews_ ? 8192 : 100000, fullRowLimit * 2)) {
+            const xmin = (context.offsetX - pointWidth) / sx, xmax = (context.offsetX + width) / sx;
+            const ymin = (context.offsetY - pointHeight) / sy, ymax = (context.offsetY + height) / sy;
+            sparseRows = yield* queryOverviewRows(overview.index, overview.swapped ? ymin : xmin, overview.swapped ? xmin : ymin,
+                overview.swapped ? ymax : xmax, overview.swapped ? xmax : ymax, fullRowLimit, Math.min(65536, Math.floor(candidates / 4)));
+            if (sparseRows) {
+                if (!sparseRows.length) return sparseRows;
+                selection = { order: sparseRows, start: 0, end: sparseRows.length };
+            }
+        }
+        // 片軸の候補だけで少数と分かる場合も直接確認し、広い格子探索と画素配列の初期化を省く。
+        // 集約する条件と最後の入力行を残す規則は維持し、少数時は小さなMapへまとめる。
+        const scanRows = candidates <= fullRowLimit || sparseRows !== null;
+        const exact = aggregate && !scanRows ? this.exactOverview(view) : null;
         if (exact) return yield* this.selectExactRows(exact, context, pixelRatio);
         const gridSlots = pixelWidth * pixelHeight * 4;
         let pixelRows: Uint32Array | null = null;
         // 縮小表示の1〜2画素の点はハッシュを使わず、画素と縦横の被覆サイズで直接引く。
         // 作業配列はviewport間で再利用し、高解像度では32MiBを超えたらMapへ戻る。
-        if (aggregate && pointWidth * pixelRatio.x <= 2 && pointHeight * pixelRatio.y <= 2 && gridSlots * 4 <= 32 * 1024 * 1024) {
+        if (aggregate && !scanRows && pointWidth * pixelRatio.x <= 2 && pointHeight * pixelRatio.y <= 2 && gridSlots * 4 <= 32 * 1024 * 1024) {
             if (!this.pixelRows_ || this.pixelRows_.length < gridSlots) this.pixelRows_ = new Uint32Array(gridSlots);
             pixelRows = this.pixelRows_.subarray(0, gridSlots);
             pixelRows.fill(0);
         }
         const columns = view.getAxisColumns();
-        const indexed = aggregate ? view.getOverviewIndex() : null;
+        const indexed = aggregate && !scanRows ? overview : null;
         const fine = indexed?.index.fine;
         const fineX = indexed?.swapped ? fine?.factorY : fine?.factorX, fineY = indexed?.swapped ? fine?.factorX : fine?.factorY;
         const coarseX = indexed ? (indexed.swapped ? indexed.index.meanSpanY : indexed.index.meanSpanX) * sx * pixelRatio.x : 0;

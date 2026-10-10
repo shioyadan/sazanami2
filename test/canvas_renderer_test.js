@@ -372,6 +372,66 @@ test("Sorted axes restrict candidates to the intersection of their ranges", () =
     loader.reset();
 });
 
+test("A sparse two-axis view avoids scanning large axis candidates without changing selected rows", async () => {
+    const n = 240003, rare = 257;
+    const csv = "x,y,color\n" + Array.from({ length: n }, (_, i) => {
+        const low = i % 64 - 1, high = 100000 + i % 128;
+        const [x, y] = i >= n - rare ? [low, low] : i % 2 ? [low, high] : [high, low];
+        return `${x},${y},${i % 3}`;
+    }).join("\n");
+    const { loader } = load(csv, { view: { axisXField: "x", axisYField: "y", colorField: "color" }, columns: {} });
+    for (const swapped of [false, true]) {
+        const view = loader.GetDataView({ view: { axisXField: swapped ? "y" : "x", axisYField: swapped ? "x" : "y", colorField: "color" }, columns: {} });
+        await loader.axisIndexes.waitForIdle();
+        for (const ratio of [1, 1.25]) {
+            const { renderer, canvas } = makeRenderer();
+            canvas.clientWidth = 114; canvas.width = Math.round(114 * ratio);
+            canvas.clientHeight = 84; canvas.height = Math.round(84 * ratio);
+            const context = { ...INITIAL_RENDERER_CONTEXT, width: 114, height: 84, scaleXLog: 0, scaleYLog: 0,
+                offsetX: 0.25, offsetY: 0.75, minPlotWidth: 2.5, minPlotHeight: 3 };
+            assert.ok(view.getVisibleRows(-3, -3, 64, 64).end - view.getVisibleRows(-3, -3, 64, 64).start > 100000);
+            let reads = 0;
+            const original = view.getX;
+            view.getX = row => { reads++; return original.call(view, row); };
+            renderer.draw(canvas, new GridMap(), view, context);
+            const indexed = renderer.rowCache_.rows;
+            view.getX = original;
+            assert.ok(reads < 1000, "Only the sparse two-axis matches should reach the rendering loop");
+            assert.equal(renderer.pixelRows_, null, "Sparse views must avoid clearing a viewport-sized aggregation array");
+            const getOverview = view.getOverviewIndex;
+            view.getOverviewIndex = () => null;
+            renderer.cancelPendingRows();
+            renderer.draw(canvas, new GridMap(), view, context);
+            assert.deepEqual(indexed, renderer.rowCache_.rows, "Clipping, last-row colors and input order must match the previous path");
+            view.getOverviewIndex = getOverview;
+
+            const soft = new CanvasRenderer(new RectRendererSoft());
+            const query = soft.selectRows(view, context, { x: ratio, y: ratio }, view.getVisibleRows(-3, -3, 64, 64));
+            let result;
+            do { result = query.next(); } while (!result.done);
+            assert.equal(result.value.length, rare, "Software compositing must retain every overlapping input row");
+            assert.ok(Array.from(result.value).every((row, i) => row === n - rare + i));
+        }
+    }
+    loader.reset();
+});
+
+test("Small axis bounds bypass overview work during tiled selection", async () => {
+    const n = 100003, csv = "x,y\n" + Array.from({ length: n }, (_, i) => `${i * 7919 % 10000019},${i}`).join("\n");
+    const { loader, view } = load(csv, { view: { axisXField: "x", axisYField: "y" }, columns: {} });
+    await loader.axisIndexes.waitForIdle();
+    assert.ok(view.getOverviewIndex());
+    const { renderer, canvas } = makeRenderer();
+    renderer.MARGIN_LEFT_ = renderer.MARGIN_BOTTOM_ = 0;
+    renderer.exactOverview = () => { throw new Error("Small bounds must skip overview queries"); };
+    const context = { ...INITIAL_RENDERER_CONTEXT, width: 256, height: 256, scaleXLog: Math.log(0.000001), scaleYLog: 0,
+        offsetY: n / 2 + 0.25 };
+    renderer.draw(canvas, new GridMap(), view, context, undefined, { axes: false, aggregateSmallViews: true });
+    assert.ok(renderer.rowCache_.rows.length > 200 && renderer.rowCache_.rows.length <= 258);
+    assert.equal(renderer.pixelRows_, null);
+    loader.reset();
+});
+
 
 test("Refined integer indexes preserve fresh Fit-scale pans and fractional raster boundaries", async () => {
     const n = 120003, csv = "x,y,color\n" + Array.from({ length: n }, (_, i) =>

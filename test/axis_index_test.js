@@ -6,7 +6,7 @@ const ts = require("typescript");
 require.extensions[".ts"] = (module, filename) => module._compile(ts.transpileModule(fs.readFileSync(filename, "utf8"), {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }
 }).outputText, filename);
-const { AxisIndexCache } = require("../src/axis_index.ts");
+const { AxisIndexCache, queryOverviewRows } = require("../src/axis_index.ts");
 const { Loader } = require("../src/loader.ts");
 
 function column(rows, multiplier) {
@@ -178,6 +178,7 @@ test("Overview levels retain all source rows within the shared index budget", as
     }
     assert.ok(seen.every(value => value === 1));
     assert.equal(index.levels.at(-1).heads[0], rows);
+    assert.equal(index.levels.at(-1).counts[0], rows);
     assert.equal(cache.getOverview([x, x]), null);
     cache.prepare([y, x], rows, () => { throw new Error("Swapped axes must reuse the overview"); });
     await cache.waitForIdle();
@@ -259,5 +260,62 @@ test("Sparse refinement retains every row and respects a limited shared budget",
     assert.deepEqual(maxima, index.levels[0].heads);
     assert.ok(seen.every(value => value === 1));
     assert.equal(index.levels.at(-1).heads[0], rows);
+    assert.equal(index.levels.at(-1).counts[0], rows);
+    const bounds = [0, 0, 15000, 17000], expected = [];
+    for (let row = 0; row < rows; row++) if (x.buffer[row] <= bounds[2] && y.buffer[row] <= bounds[3]) expected.push(row);
+    const query = queryOverviewRows(index, ...bounds, rows, 1000000);
+    let result;
+    do { result = query.next(); } while (!result.done);
+    assert.deepEqual(Array.from(result.value), expected, "Refined links must enumerate every matching row exactly once");
+    cache.clear();
+});
+
+test("Counted regions reject dense queries without reading coordinates and bound unfinished queries", async () => {
+    const rows = 120003;
+    const makeColumn = max => {
+        const buffer = Int32Array.from({ length: rows }, (_, i) => i % (max + 1));
+        return { buffer, stat: { min: 0, max, deviationFromMax: max }, getNumber(i) { return buffer[i]; } };
+    };
+    const x = makeColumn(3), y = makeColumn(1023), cache = new AxisIndexCache(2 * 1024 * 1024);
+    cache.prepare([x, y], rows, () => {});
+    await cache.waitForIdle();
+    const index = cache.getOverview([x, y]);
+    assert.equal(index.levels.at(-1).counts.reduce((sum, count) => sum + count, 0), rows);
+    assert.ok(cache.memoryBytes <= cache.budgetBytes);
+    x.getNumber = y.getNumber = () => { throw new Error("Dense queries must use stored counts"); };
+    assert.deepEqual(queryOverviewRows(index, 0, 0, 3, 1023, 128).next(), { done: true, value: null });
+    assert.deepEqual(queryOverviewRows(index, 0, 0, 3, 1023, rows, 0).next(), { done: true, value: null });
+    const empty = queryOverviewRows(index, 4, 0, 5, 1023, 128).next();
+    assert.equal(empty.done, true);
+    assert.equal(empty.value.length, 0);
+    cache.clear();
+});
+
+test("Counted two-axis queries retain ties and partial regions while excluding nonfinite rows", async () => {
+    const rows = 100009;
+    const makeColumn = (size, stride, offset) => {
+        const buffer = Float64Array.from({ length: rows }, (_, i) => i * stride % size + offset);
+        return { buffer, stat: { min: offset, max: offset + size - 1, deviationFromMax: size }, getNumber(i) { return buffer[i]; } };
+    };
+    const x = makeColumn(251, 31, -125.25), y = makeColumn(253, 17, -126.75);
+    x.buffer[0] = NaN; x.buffer[1] = Infinity; y.buffer[2] = -Infinity;
+    const cache = new AxisIndexCache(4 * 1024 * 1024);
+    cache.prepare([x, y], rows, () => {});
+    await cache.waitForIdle();
+    const index = cache.getOverview([x, y]);
+    assert.equal(index.levels.at(-1).counts[0], rows - 3);
+    const bytes = index.next.byteLength + index.levels.reduce((sum, level) => sum + level.heads.byteLength +
+        (level.counts?.byteLength ?? 0) + (level.boundsX?.byteLength ?? 0) + (level.boundsY?.byteLength ?? 0), 0);
+    assert.equal(index.memoryBytes, bytes);
+    assert.ok(cache.memoryBytes <= cache.budgetBytes);
+    for (const bounds of [[-4.3, 12.1, 4.7, 17.9], [-125.25, -126.75, -124.25, -125.75], [5, 8, 5, 8]]) {
+        const expected = [];
+        for (let row = 0; row < rows; row++) if (Number.isFinite(x.buffer[row]) && Number.isFinite(y.buffer[row]) &&
+            x.buffer[row] >= bounds[0] && x.buffer[row] <= bounds[2] && y.buffer[row] >= bounds[1] && y.buffer[row] <= bounds[3]) expected.push(row);
+        const query = queryOverviewRows(index, ...bounds, 512);
+        let result;
+        do { result = query.next(); } while (!result.done);
+        assert.deepEqual(Array.from(result.value), expected);
+    }
     cache.clear();
 });
