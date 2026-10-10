@@ -408,6 +408,11 @@ export class DataView {
         return index ? { index, swapped: index.columns[0] !== this.xCol_ } : null;
     }
 
+    // 値の範囲に入る行を含む候補区間[start, end)を返す。orderがnullなら元の行順を使う。
+    // 軸索引の参照先の値は昇順なので、X/Yの範囲の両端と候補件数を二分探索で求められる。
+    // 両軸の候補集合を列挙して交差させず、単調な軸を元の行順で絞った区間も含め、
+    // 候補件数が最少の区間を選ぶ。多い側の列挙と共通集合用の一時メモリを省くため。
+    // 各候補が両軸の条件を満たすかは描画側で確認するため、区間の長さは正確な対象行数とは限らない。
     getVisibleRows(xMin: number, yMin: number, xMax: number, yMax: number): { order: Uint32Array | null; start: number; end: number } {
         let selection: { order: Uint32Array | null; start: number; end: number } = {
             order: null, start: this.getStartIdx(xMin, yMin), end: this.getEndIdx(xMax, yMax) + 1

@@ -424,6 +424,8 @@ class CanvasRenderer {
                 } else {
                     row = selection.order ? selection.order[position] : position;
                 }
+                // 軸索引で選んだ候補には、もう一方の軸で範囲外の行も含まれることがある。
+                // 両軸の点矩形と表示範囲の重なりを確認し、端に一部だけ見える点も残す。
                 const y = view.getY(row) * sy - context.offsetY;
                 if (!Number.isFinite(y) || y + pointHeight < 0 || y >= height) continue;
                 const x = this.MARGIN_LEFT_ + view.getX(row) * sx - context.offsetX;

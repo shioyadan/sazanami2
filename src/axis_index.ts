@@ -332,6 +332,7 @@ async function buildIndex(column: ColumnInterface, rows: number, cancelled: () =
 }
 
 export class AxisIndexCache {
+    // 列の値順に並べた元の行番号。値の範囲を二分探索できるようにし、元データは並べ替えない。
     private entries = new Map<ColumnInterface, Uint32Array>();
     private columns: ColumnInterface[] = [];
     private axes: ColumnInterface[] = [];
