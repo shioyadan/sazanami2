@@ -202,9 +202,9 @@ class TiledCanvasRenderer {
         this.tileJobs_ = positions.filter(job => (job.visible || !this.tilePrefetchDisabled_) && !this.tiles_.has(job.key)).sort((a, b) => a.priority - b.priority);
         if (this.tilePending_) {
             const next = this.tileJobs_.find(job => job.key === this.tilePending_!.job.key);
-            // panで可視範囲が変わったら先読みの準備を中断して可視tileへ譲る。
+            // zoom中やpanで可視範囲が変わったら先読みの準備を中断して可視tileへ譲る。
             // 準備中のtile自体が可視になった場合は同じ座標の結果を引き継ぐ。
-            if (!next || (!next.visible && this.tileJobs_.some(job => job.visible))) {
+            if (!next || (!next.visible && (!this.tileSettled_ || this.tileJobs_.some(job => job.visible)))) {
                 this.tileBuilder_?.cancelPendingRows(); this.tilePending_.canvas.width = 1; this.tilePending_ = null;
             } else this.tilePending_.job = next;
         }
@@ -235,11 +235,15 @@ class TiledCanvasRenderer {
             if (Math.max(previousArea, fallbackArea) < (context.width - this.renderer_.MARGIN_LEFT_) * (context.height - this.renderer_.MARGIN_BOTTOM_) * ratio.x * ratio.y * 0.25) {
                 if (!previous || !(this.renderer_.rectRenderer instanceof RectRendererWebGL) || canvas.width * canvas.height * 4 > 16 * 1024 * 1024) return false;
                 // 大きな縮小の直接fallbackも別canvasで準備し、既存画像からfadeする。
-                // viewport画像は旧画像と作業画像の各16MiBまで。tileの64MiB予算は増やさない。
+                // 全viewportのrasterと2×2平均を急ぐと、tileの枚数制限とは別にUIを止める。
+                // 暫定画像の画素数も1tile分までとし、完成tileは元の解像度で生成する。
                 if (!this.directPlot_) {
                     const image = this.directCanvas_ ??= document.createElement("canvas");
-                    image.width = canvas.width; image.height = canvas.height;
-                    image.getContext("2d")!.setTransform(ratio.x, 0, 0, ratio.y, 0, 0);
+                    const pixels = TiledCanvasRenderer.TILE_SIZE ** 2;
+                    const shrink = Math.min(1, Math.sqrt(pixels / (canvas.width * canvas.height)));
+                    image.width = Math.max(1, Math.min(pixels, Math.floor(canvas.width * shrink)));
+                    image.height = Math.max(1, Math.min(pixels, Math.floor(canvas.height * shrink)));
+                    image.getContext("2d")!.setTransform(image.width / context.width, 0, 0, image.height / context.height, 0, 0);
                     this.directPlot_ = { canvas: image, context, grid: new GridMap(), ready: false, shownAt: null };
                 }
             }
@@ -308,7 +312,8 @@ class TiledCanvasRenderer {
             sources: new Set([...fallback, ...tiles].flatMap(tile => tile.canvas ? [tile.canvas] : [])
                 .concat(!complete && previous ? [previous.canvas] : [], directAlpha > 0 && direct ? [direct.canvas] : [])),
             changed: directAlpha > 0 || (tiles.length > 0 && this.tileShownAt_ !== null && now > this.tileShownAt_),
-            complete: (complete && native) || (directAlpha === 1 && this.zoomKey(direct!.context.scaleXLog, direct!.context.scaleYLog) === zoomKey) };
+            // 低解像度の直接画像は同じ倍率でも暫定扱いにし、完成tileへのfadeを省略しない。
+            complete: complete && native };
         return true;
     }
 
@@ -340,12 +345,15 @@ class TiledCanvasRenderer {
     private blitPlot(ctx: CanvasRenderingContext2D, plot: { canvas: HTMLCanvasElement; context: RendererContext }, request: TileRequest): void {
         const { context: c, ratio: r } = request;
         const sx = Math.exp(c.scaleXLog - plot.context.scaleXLog), sy = Math.exp(c.scaleYLog - plot.context.scaleYLog);
-        const left = this.renderer_.MARGIN_LEFT_ * r.x, width = plot.canvas.width - left;
-        const height = (plot.context.height - this.renderer_.MARGIN_BOTTOM_) * r.y;
+        const sourceRatio = { x: plot.canvas.width / plot.context.width, y: plot.canvas.height / plot.context.height };
+        const left = this.renderer_.MARGIN_LEFT_ * sourceRatio.x, width = plot.canvas.width - left;
+        const height = (plot.context.height - this.renderer_.MARGIN_BOTTOM_) * sourceRatio.y;
         // 薄い点が縮小で落ちないよう補間し、軸の余白が外周tileを隠さないようplotだけ貼る。
-        ctx.imageSmoothingEnabled = sx !== 1 || sy !== 1;
+        // 暫定画像は表示canvasと解像度が異なるため、srcとdstの画素比を別々に使う。
+        ctx.imageSmoothingEnabled = sx * r.x !== sourceRatio.x || sy * r.y !== sourceRatio.y;
         ctx.drawImage(plot.canvas, left, 0, width, height,
-            left + (plot.context.offsetX * sx - c.offsetX) * r.x, (plot.context.offsetY * sy - c.offsetY) * r.y, width * sx, height * sy);
+            this.renderer_.MARGIN_LEFT_ * r.x + (plot.context.offsetX * sx - c.offsetX) * r.x, (plot.context.offsetY * sy - c.offsetY) * r.y,
+            (plot.context.width - this.renderer_.MARGIN_LEFT_) * r.x * sx, (plot.context.height - this.renderer_.MARGIN_BOTTOM_) * r.y * sy);
     }
 
     private tileBounds(tile: PlotTile, request: TileRequest): [number, number, number, number] {
@@ -384,7 +392,8 @@ class TiledCanvasRenderer {
 
     private scheduleTiles(): void {
         if (this.tileFrame_ !== null || !this.tileRequest_) return;
-        const build = this.tileJobs_.length && !this.tileBuilder_?.isPreparingRows;
+        // zoom中は可視tileだけ進める。先読みは停止後に再開し、入力・合成の時間を残す。
+        const build = this.tileJobs_.length && (this.tileJobs_[0].visible || this.tileSettled_) && !this.tileBuilder_?.isPreparingRows;
         // 未完了の行準備だけなら通知を待つ。画像の切替中だけは再描画を続ける。
         if (!build && !this.tileFading_) return;
         this.tileFrame_ = window.requestAnimationFrame(() => {
@@ -396,14 +405,20 @@ class TiledCanvasRenderer {
 
     private renderTileBatch(): void {
         const request = this.tileRequest_;
-        if (!request) return;
+        if (!request || (!this.tileJobs_[0]?.visible && !this.tileSettled_)) return;
         const start = performance.now(), generation = this.tileGeneration_, size = TiledCanvasRenderer.TILE_SIZE;
         const builder = this.tileBuilder_ ??= new CanvasRenderer(this.renderer_.rectRenderer);
         builder.MARGIN_LEFT_ = builder.MARGIN_BOTTOM_ = 0;
-        const visibleBatch = this.tileJobs_[0]?.visible, budget = visibleBatch ? 6 : 3, limit = visibleBatch ? 4 : 2;
+        // 軽いtileは同じframeで進め、操作中は入力・合成へ時間を残す。
+        // 停止後は予算を広げて仕上げる。1枚の描画・転送は途中で止められないため、
+        // 時間は終了後に判定する目安とし、空tile等にも枚数の上限を設ける。
+        const visibleBatch = this.tileJobs_[0]?.visible;
+        const budget = this.tileSettled_ ? (visibleBatch ? 6 : 3) : 2;
+        const limit = this.tileSettled_ ? (visibleBatch ? 8 : 4) : 2;
         let count = 0, changed = false;
         while (count < limit && this.tileJobs_.length) {
             const job = this.tilePending_?.job ?? this.tileJobs_[0];
+            // 可視tileの完了後は一度表示へ譲り、先読みを同じframeに積み増さない。
             if (count && job.visible !== visibleBatch) break;
             if (!this.tilePending_) {
                 const canvas = document.createElement("canvas"); canvas.width = canvas.height = size;

@@ -258,6 +258,7 @@ class CanvasRenderer {
         const pw = Math.max(sx, context.minPlotWidth), ph = Math.max(sy, context.minPlotHeight);
         const pixelWidth = Math.ceil(context.width * pixelRatio.x), pixelHeight = Math.ceil(context.height * pixelRatio.y);
         const codes: Uint32Array[] = [];
+        let firstCell = 0, lastCell = fine.width * fine.height;
         // 疎な細分格子の各軸を一度だけ投影し、領域ごとの乗算・ceilを避ける。
         for (let axis = 0; axis < 2; axis++) {
             const column = index.columns[axis], horizontal = (axis === 0) !== swapped;
@@ -268,6 +269,7 @@ class CanvasRenderer {
             const scale = horizontal ? sx : sy, point = horizontal ? pw : ph, ratio = horizontal ? pixelRatio.x : pixelRatio.y;
             const margin = horizontal ? this.MARGIN_LEFT_ : 0, offset = horizontal ? context.offsetX : context.offsetY;
             const clipEnd = horizontal ? context.width : context.height - this.MARGIN_BOTTOM_, pixelEnd = horizontal ? pixelWidth : pixelHeight;
+            let first = size, last = 0;
             for (let bin = 0; bin < size; bin++) {
                 if ((bin & 8191) === 0) yield;
                 // 整数境界を外側へ1だけ広げ、格子計算の浮動小数点誤差でも行を落とさない。
@@ -285,18 +287,29 @@ class CanvasRenderer {
                     }
                 }
                 table[bin] = code;
+                if (axis === 1 && code) { first = Math.min(first, bin); last = bin + 1; }
             }
             codes.push(table);
+            if (axis === 1) { firstCell = first * fine.width; lastCell = last * fine.width; }
         }
         const [xl, yl] = lookup, xValues = columns[0].buffer!, yValues = columns[1].buffer!;
         const xBase = pixelWidth + 1, yBase = pixelHeight + 1;
+        // 細分格子は行方向の領域番号で昇順に並ぶ。画面と交わる帯の両端を二分探索し、
+        // tileごとに索引全体を走査しない。部分表示も含むcodeの範囲を使い、他軸は各領域で確認する。
+        const cells = fine.cells;
+        const lowerBound = (key: number) => {
+            let lo = 0, hi = cells.length / 2;
+            while (lo < hi) { const mid = (lo + hi) >>> 1; if (cells[mid * 2] < key) lo = mid + 1; else hi = mid; }
+            return lo * 2;
+        };
+        const start = lowerBound(firstCell), end = lowerBound(lastCell);
         let visits = 0;
-        for (let slot = 0; slot < fine.cells.length; slot += 2) {
+        for (let slot = start; slot < end; slot += 2) {
             if ((slot & 2047) === 0) yield;
-            const cell = fine.cells[slot];
-            let head = fine.cells[slot + 1];
+            const cell = cells[slot];
             const a = codes[0][cell % fine.width], b = codes[1][Math.floor(cell / fine.width)];
             if (!a || !b) continue;
+            let head = cells[slot + 1];
             if (a !== 0xffffffff && b !== 0xffffffff) {
                 const key = a + b - 2;
                 if (head > pixelRows[key]) pixelRows[key] = head;
@@ -734,7 +747,9 @@ class CanvasRenderer {
         const gridRowRatio = gridRows / visibleRows;
 
         // データ描画＆インデックス記録
-        const raster = this.rectRenderer instanceof RectRendererWebGL && this.exactOverview(dataView) &&
+        // 不透明な細い点は、索引の形によらずGPUと同じ画素被覆を直接描ける。
+        // InstId/cycleのような広い両軸でも、GL画像のサイズ変更とCanvas間転送を避ける。
+        const raster = this.rectRenderer instanceof RectRendererWebGL &&
             canvas.width > 0 && canvas.height > 0 && canvas.width * canvas.height * samples * samples * 4 <= 16 * 1024 * 1024 &&
             Math.min(pxW * pixelRatio.x, pxH * pixelRatio.y) <= 2 * samples && colorPalette.every(color => (color >>> 24) === 255) &&
             (samples === 2 || rows.length * Math.ceil(pxW * pixelRatio.x) * Math.ceil(pxH * pixelRatio.y) <= canvas.width * canvas.height * 4);

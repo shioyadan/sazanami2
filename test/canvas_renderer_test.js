@@ -501,6 +501,38 @@ test("Refined integer indexes preserve fresh Fit-scale pans and fractional raste
     loader.reset();
 });
 
+test("Refined tile queries restrict sorted cells to the visible band without changing rows", async () => {
+    const n = 120003, csv = "x,y,color\n" + Array.from({ length: n }, (_, i) => {
+        const value = i * 7919 % 60001;
+        return `${value * 10},${value},${i % 3}`;
+    }).join("\n");
+    const { loader, view } = load(csv, { view: { axisXField: "x", axisYField: "y", colorField: "color" }, columns: {} });
+    await loader.axisIndexes.waitForIdle();
+    const fine = view.getOverviewIndex().index.fine;
+    assert.ok(fine);
+    const cells = fine.cells;
+    let reads = 0;
+    fine.cells = new Proxy(cells, { get(target, key) {
+        if (typeof key === "string" && /^\d+$/.test(key)) reads++;
+        return Reflect.get(target, key, target);
+    } });
+    const { renderer, canvas } = makeRenderer();
+    renderer.MARGIN_LEFT_ = renderer.MARGIN_BOTTOM_ = 0;
+    canvas.width = canvas.clientWidth = canvas.height = canvas.clientHeight = 16;
+    const context = { ...INITIAL_RENDERER_CONTEXT, width: 16, height: 16,
+        scaleXLog: Math.log(0.0008), scaleYLog: Math.log(0.0008), offsetX: 12.37, offsetY: 1.53 };
+    try {
+        renderer.draw(canvas, new GridMap(), view, context, undefined, { axes: false, aggregateSmallViews: true });
+        const actual = renderer.rowCache_.rows;
+        assert.ok(actual.length);
+        assert.ok(reads < cells.length * 0.6, "Offscreen bands must not require scanning the entire refined index");
+        view.getOverviewIndex = () => null;
+        renderer.cancelPendingRows();
+        renderer.draw(canvas, new GridMap(), view, context, undefined, { axes: false, aggregateSmallViews: true });
+        assert.deepEqual(actual, renderer.rowCache_.rows, "Clipped points and last-row colors must match a scan of the axis candidates");
+    } finally { fine.cells = cells; loader.reset(); }
+});
+
 test("Exact interval queries preserve the last row across categories, swaps and pixel boundaries", async () => {
     const n = 120003, csv = "category,time,color\n" + Array.from({ length: n }, (_, i) =>
         `${i % 7 - 3},${i * 7919 % 60001 - 30000},${i % 3}`
@@ -642,7 +674,30 @@ test("Subpixel raster averages coverage with background and reuses its output", 
     assert.deepEqual(Array.from(image.data), [28, 30, 35, 255, 28, 30, 35, 255]);
 });
 
-test("Direct raster is limited to small opaque indexed points and bounded image memory", async () => {
+test("Opaque thin points avoid GPU transfer without an exact overview on either axis", () => {
+    const { loader, view } = load("x,y,color\n100,100,0\n100,100,1\n200000,200000,0", {
+        view: { axisXField: "x", axisYField: "y", colorField: "color" }, columns: {}
+    });
+    const { renderer, canvas } = makeRenderer(), backend = new RectRendererWebGL();
+    renderer.rectRenderer = backend;
+    assert.equal(renderer.exactOverview(view), null);
+    view.getPalette = () => new Uint32Array([0xff0000ff, 0xffff0000]);
+    backend.beginRawMode = () => { throw new Error("Thin opaque points must not require GPU transfer"); };
+    canvas.width = canvas.clientWidth = 90; canvas.height = canvas.clientHeight = 60;
+    const ctx = canvas.getContext("2d");
+    let displayed;
+    ctx.createImageData = (width, height) => ({ width, height, data: new Uint8ClampedArray(width * height * 4) });
+    ctx.putImageData = image => displayed = new Uint32Array(image.data.buffer);
+    try {
+        renderer.draw(canvas, new GridMap(), view, { ...INITIAL_RENDERER_CONTEXT, width: 90, height: 60,
+            scaleXLog: Math.log(0.001), scaleYLog: Math.log(0.001), offsetX: 0.37, offsetY: 0.53 }, undefined,
+            { axes: false, smoothOverview: true });
+        assert.equal(displayed[50], 0xffff0000, "The clipped duplicate must retain the last input row's color");
+        assert.equal(backend.rasterSamples_, 1, "Wide axes must preserve their existing single-sample colors");
+    } finally { loader.reset(); }
+});
+
+test("Direct raster is limited to small opaque points and bounded image memory", async () => {
     const n = 120003, csv = "category,time\n" + Array.from({ length: n }, (_, i) => `${i % 3},${i % 60001}`).join("\n");
     const { loader, view } = load(csv, { view: { axisXField: "category", axisYField: "time" }, columns: {} });
     await loader.axisIndexes.waitForIdle();
@@ -788,9 +843,80 @@ test("Tiles reuse integer pans and previous zoom levels without rerunning row se
     } finally { env.restore(); loader.reset(); }
 });
 
+test("Tile updates cap visible and prefetched batches and defer prefetch during zoom", () => {
+    const { loader, view } = load(gridCSV), env = tileEnvironment(), { renderer, tiledRenderer: tiled, canvas } = env;
+    const previousPerformance = global.performance;
+    global.performance = { now: () => 1000 };
+    canvas.width = canvas.clientWidth = 1280; canvas.height = canvas.clientHeight = 768;
+    let context = { ...INITIAL_RENDERER_CONTEXT, width: 1280, height: 768, scaleXLog: 0, scaleYLog: 0 };
+    tiled.tileBuilder_ = new CanvasRenderer(renderer.rectRenderer);
+    let draws = 0;
+    tiled.tileBuilder_.draw = () => { draws++; return Uint32Array.of(0); };
+    const paint = () => tiled.draw(canvas, new GridMap(), view, context, () => {}, { tiled: true });
+    const tick = () => {
+        const [id, fn] = env.frames.entries().next().value;
+        const visible = tiled.tileJobs_[0]?.visible, candidates = tiled.tileJobs_.filter(job => job.visible === visible).length;
+        const limit = tiled.tileSettled_ ? (visible ? 8 : 4) : 2;
+        env.frames.delete(id); const before = draws; fn();
+        assert.equal(draws - before, Math.min(limit, candidates), "A frame must cap tiles and yield before switching to prefetch");
+    };
+    try {
+        paint();
+        while (tiled.tileJobs_.some(job => job.visible)) tick();
+        paint();
+        const image = document.createElement("canvas"); image.width = image.height = 256;
+        tiled.tilePending_ = { job: tiled.tileJobs_[0], canvas: image, context };
+        tiled.tileBuilder_.pendingRows_ = { view, context, pixelRatio: { x: 1, y: 1 } };
+        context = { ...context, scaleXLog: 0.01, scaleYLog: 0.01 };
+        paint();
+        assert.equal(tiled.tileSettled_, false);
+        assert.equal(tiled.tilePending_, null, "Zoom must cancel an unfinished outer tile");
+        assert.equal(tiled.tileBuilder_.isPreparingRows, false);
+        assert.equal(image.width, 1);
+        assert.ok(tiled.tileJobs_.length && tiled.tileJobs_.every(job => !job.visible));
+        const before = draws;
+        for (const [id, fn] of Array.from(env.frames)) { env.frames.delete(id); fn(); }
+        assert.equal(draws, before, "A queued prefetch must yield when zoom starts");
+        assert.equal(env.frames.size, 0, "Paused prefetch must not spin animation frames");
+        const [id, fn] = env.timers.entries().next().value; env.timers.delete(id); fn();
+        paint();
+        while (env.frames.size) tick();
+        assert.ok(draws > before, "Idle must resume the pending tiles");
+        assert.equal(tiled.tileJobs_.length, 0);
+    } finally { env.restore(); loader.reset(); global.performance = previousPerformance; }
+});
+
+test("Tile generation yields on time budgets before starting another image", () => {
+    const { loader, view } = load(gridCSV), previousPerformance = global.performance;
+    try {
+        for (const [settled, visible, cost, expected] of [
+            [false, true, 0, 2], [false, true, 2, 1],
+            [true, true, 3, 2], [true, true, 7, 1],
+            [true, false, 0, 4], [true, false, 1.5, 2], [true, false, 4, 1]
+        ]) {
+            const env = tileEnvironment(), { renderer, tiledRenderer: tiled, canvas } = env;
+            let now = 1000, draws = 0;
+            global.performance = { now: () => now };
+            canvas.width = canvas.clientWidth = 1280; canvas.height = canvas.clientHeight = 768;
+            tiled.tileBuilder_ = new CanvasRenderer(renderer.rectRenderer);
+            tiled.tileBuilder_.draw = () => { now += cost; draws++; return Uint32Array.of(0); };
+            try {
+                tiled.draw(canvas, new GridMap(), view, { ...INITIAL_RENDERER_CONTEXT, width: 1280, height: 768 }, () => {}, { tiled: true });
+                tiled.tileSettled_ = settled;
+                tiled.tileJobs_ = tiled.tileJobs_.filter(job => job.visible === visible);
+                const [id, fn] = env.frames.entries().next().value; env.frames.delete(id); fn();
+                assert.equal(draws, expected, `Unexpected image count for settled=${settled}, visible=${visible}, cost=${cost}`);
+                assert.ok(tiled.tileJobs_.length, "Remaining work must resume on a later frame");
+                assert.equal(env.frames.size, 1);
+            } finally { env.restore(); }
+        }
+    } finally { global.performance = previousPerformance; loader.reset(); }
+});
+
 test("Rapid zooms keep the last complete layer instead of an incomplete intermediate layer", () => {
     const { loader, view } = load(gridCSV), env = tileEnvironment(), { tiledRenderer, canvas } = env;
-    let context = { ...INITIAL_RENDERER_CONTEXT, width: 690, height: 340, scaleXLog: Math.log(10), scaleYLog: Math.log(10) };
+    canvas.width = canvas.clientWidth = 1280; canvas.height = canvas.clientHeight = 768;
+    let context = { ...INITIAL_RENDERER_CONTEXT, width: 1280, height: 768, scaleXLog: Math.log(10), scaleYLog: Math.log(10) };
     const paint = () => tiledRenderer.draw(canvas, new GridMap(), view, context, () => {}, { tiled: true });
     try {
         // 完成通知後の再描画を挟まずzoomし、直前frameで未確認の完成tileも引き継ぐ。
@@ -1152,6 +1278,40 @@ test("Direct fallback and its replacement preserve an interrupted fade", () => {
         assert.deepEqual(canvas.rgb, [127.5, 0, 127.5]);
         const saved = tiled.previousPlot_.canvas, scratch = tiled.directCanvas_;
         tiled.clear(); assert.equal(saved.width, 1); assert.equal(scratch.width, 1);
+    } finally { env.restore(); }
+});
+
+test("Large zoom jump previews bound raster work and scale back to the viewport", () => {
+    const env = solidTileEnvironment(), { renderer, tiledRenderer: tiled, context: fit, view, create } = env;
+    renderer.MARGIN_LEFT_ = 50; renderer.MARGIN_BOTTOM_ = 20;
+    const canvas = create([0, 0, 255]);
+    canvas.clientWidth = 1024; canvas.clientHeight = 512; canvas.width = 1280; canvas.height = 640;
+    tiled.tileContentKey_ = "1.25,1.25,1,1";
+    const context = { ...fit, width: 1024, height: 512, scaleXLog: Math.log(0.01), scaleYLog: Math.log(0.01) };
+    const copies = [], ctx = canvas.getContext("2d"), draw = ctx.drawImage;
+    ctx.drawImage = function(image, ...args) { copies.push({ image, args, smooth: this.imageSmoothingEnabled }); draw.call(this, image, ...args); };
+    renderer.draw = (target, _grid, _view, c, _notify, options) => {
+        assert.ok(target.width * target.height <= 256 * 256, "Preview raster work must stay within one tile of pixels");
+        assert.equal(c.width, 1024); assert.equal(c.height, 512);
+        assert.equal(options.smoothOverview, true);
+        target.rgb = [255, 0, 0]; return Uint32Array.of(0);
+    };
+    const paint = () => tiled.draw(canvas, new GridMap(), view, context, () => {}, { tiled: true });
+    try {
+        tiled.tileZoomKey_ = tiled.zoomKey(0, 0); paint();
+        const preview = tiled.directPlot_.canvas;
+        assert.ok(preview.width < canvas.width && preview.height < canvas.height);
+        assert.deepEqual(canvas.rgb, [0, 0, 255]);
+        env.advance(60); copies.length = 0; paint();
+        const copy = copies.find(copy => copy.image === preview);
+        const sourceLeft = 50 * (preview.width / context.width);
+        assert.deepEqual(copy.args, [sourceLeft, 0, preview.width - sourceLeft, 492 * (preview.height / context.height),
+            62.5, 0, 1217.5, 615], "Preview cropping must use its own resolution and retain the display margins at fractional DPR");
+        assert.equal(copy.smooth, true, "The smaller preview must be interpolated even at the same zoom");
+        assert.deepEqual(canvas.rgb, [127.5, 0, 127.5]);
+        env.advance(60); paint();
+        assert.deepEqual(canvas.rgb, [255, 0, 0]);
+        assert.equal(tiled.displayedPlot_.complete, false, "The preview must still fade into full-resolution tiles");
     } finally { env.restore(); }
 });
 
