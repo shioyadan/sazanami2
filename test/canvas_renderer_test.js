@@ -70,6 +70,38 @@ const gridCSV = "cycle,unit\n" + Array.from({ length: 6 }, (_, y) =>
     Array.from({ length: 6 }, (_, x) => `${y},${x}`).join("\n")
 ).join("\n");
 
+test("Drag zoom stays strictly monotonic across the starting position on either axis", () => {
+    const { renderer } = makeRenderer();
+    const initial = { ...INITIAL_RENDERER_CONTEXT, width: 1000, height: 600,
+        scaleXLog: Math.log(2.5), scaleYLog: Math.log(3.5), offsetX: 123.25, offsetY: 245.75 };
+    for (const axis of ["x", "y"]) {
+        let previous = -Infinity;
+        for (let displacement = -20; displacement <= 20; displacement += 0.25) {
+            const next = renderer.zoomDrag(initial, 180.5, 210.5,
+                axis === "x" ? displacement : 0, axis === "y" ? displacement : 0);
+            const active = axis === "x" ? next.scaleXLog : next.scaleYLog;
+            assert.ok(active > previous, "Every nonzero movement must change the zoom, including around its starting scale");
+            previous = active;
+            assert.equal(axis === "x" ? next.scaleYLog : next.scaleXLog,
+                axis === "x" ? initial.scaleYLog : initial.scaleXLog);
+        }
+    }
+});
+
+test("Drag zoom preserves its canvas anchor and returns exactly to the initial viewport", () => {
+    const { renderer } = makeRenderer();
+    const initial = { ...INITIAL_RENDERER_CONTEXT, width: 1000, height: 600,
+        scaleXLog: Math.log(2.5), scaleYLog: Math.log(3.5), offsetX: 123.25, offsetY: 245.75 };
+    const mouseX = 180.5, mouseY = 210.5;
+    const anchor = ctx => [(mouseX - renderer.MARGIN_LEFT_ + ctx.offsetX) / Math.exp(ctx.scaleXLog),
+        (mouseY + ctx.offsetY) / Math.exp(ctx.scaleYLog)];
+    for (const [dx, dy] of [[0.25, -0.25], [500, 300], [-500, -300], [0, 0]]) {
+        const next = renderer.zoomDrag(initial, mouseX, mouseY, dx, dy);
+        anchor(next).forEach((value, axis) => assert.ok(Math.abs(value - anchor(initial)[axis]) < 1e-10));
+    }
+    assert.deepEqual(renderer.zoomDrag(initial, mouseX, mouseY, 0, 0), initial);
+});
+
 for (const [width, height] of [[500, 340], [500, 343], [900, 687], [300, 179]]) {
     test(`Fit renders all 128 sample points at ${width}x${height}`, () => {
         const { view } = load(sample);

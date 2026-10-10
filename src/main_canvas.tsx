@@ -432,15 +432,16 @@ const MainCanvas: React.FC<{ store: Store }> = ({ store }) => {
             }
         };
 
-        // Drag handlers for panning and pinching
+        // ドラッグによるパンとズーム
         let dragState: null | {
             type: "pan",
             lastX: number,
             lastY: number
         } | {
             type: "pinch",
-            initialScaleXLog: number,
-            initialScaleYLog: number,
+            initialContext: RendererContext,
+            mouseX: number,
+            mouseY: number,
             dx: number,
             dy: number
         } = null;
@@ -456,10 +457,13 @@ const MainCanvas: React.FC<{ store: Store }> = ({ store }) => {
             canvas.style.cursor = "grabbing";
 
             if (e.button == 2) {
+                const rect = canvas.getBoundingClientRect();
                 dragState = {
                     type: "pinch",
-                    initialScaleXLog: store.state.renderCtx.scaleXLog,
-                    initialScaleYLog: store.state.renderCtx.scaleYLog,
+                    initialContext: store.state.renderCtx,
+                    // Pointer Lockの成否によらず、開始点のCanvas内CSS座標をズームの中心にする。
+                    mouseX: e.clientX - rect.left,
+                    mouseY: e.clientY - rect.top,
                     dx: 0,
                     dy: 0
                 };
@@ -511,10 +515,7 @@ const MainCanvas: React.FC<{ store: Store }> = ({ store }) => {
                     dragState.dx += e.movementX;
                     dragState.dy += e.movementY;
 
-                    next = renderer.applyZoom(store.state.renderCtx, e.clientX, e.clientY, {
-                        x: dragState.initialScaleXLog + Math.sign(dragState.dx) * Math.max(0, Math.log(Math.abs(dragState.dx) / canvas.width * 1e2)),
-                        y: dragState.initialScaleYLog + Math.sign(dragState.dy) * Math.max(0, Math.log(Math.abs(dragState.dy) / canvas.height * 1e2))
-                    });
+                    next = renderer.zoomDrag(dragState.initialContext, dragState.mouseX, dragState.mouseY, dragState.dx, dragState.dy);
                     break;
             }
 

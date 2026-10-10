@@ -582,6 +582,16 @@ class CanvasRenderer {
         };
     }
 
+    zoomDrag(initial: RendererContext, mouseX: number, mouseY: number, dx: number, dy: number): RendererContext {
+        // 開始位置の前後にも停止区間を作らない。asinhは原点で滑らかに符号が変わり、
+        // 遠くでは従来の符号付きlogに近づくので、大きいドラッグの操作感を保つ。
+        // 移動量も表示寸法もCSS pxで扱い、DPRによって感度が変わることを避ける。
+        return this.applyZoom(initial, mouseX, mouseY, {
+            x: initial.scaleXLog + Math.asinh(dx / Math.max(1, initial.width) * 50),
+            y: initial.scaleYLog + Math.asinh(dy / Math.max(1, initial.height) * 50)
+        });
+    }
+
     private applyZoomDiv(
         renderCtx: RendererContext,
         mouseX: number,
