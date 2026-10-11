@@ -69,6 +69,9 @@ const sample = fs.readFileSync(path.join(__dirname, "../docs/sample.csv"), "utf8
 const gridCSV = "cycle,unit\n" + Array.from({ length: 6 }, (_, y) =>
     Array.from({ length: 6 }, (_, x) => `${y},${x}`).join("\n")
 ).join("\n");
+const wideGridCSV = "cycle,unit\n" + Array.from({ length: 6 }, (_, y) =>
+    Array.from({ length: 6 }, (_, x) => `${y * 10000},${x * 10000}`).join("\n")
+).join("\n");
 
 test("Drag zoom stays strictly monotonic across the starting position on either axis", () => {
     const { renderer } = makeRenderer();
@@ -835,6 +838,12 @@ test("A tile working set above the memory budget falls back without regenerating
         assert.equal(tiledRenderer.tileBytes_, 0);
         paint(); env.drain();
         assert.equal(builds, 1, "The same oversized working set must use direct rendering thereafter");
+        canvas.width = canvas.clientWidth = 900;
+        tiledRenderer.tileBuilder_ = new CanvasRenderer(renderer.rectRenderer);
+        tiledRenderer.tileBuilder_.draw = () => new Uint32Array(0);
+        tiledRenderer.draw(canvas, new GridMap(), view, { ...context, width: 900 }, () => {}, { tiled: true });
+        env.drain();
+        assert.ok(tiledRenderer.tiles_.size, "Resizing must retry the cache even after a previous budget fallback");
     } finally { env.restore(); loader.reset(); }
 });
 
@@ -1082,6 +1091,249 @@ test("Expanded prefetch evicts obsolete tiles before dropping the current outer 
     } finally { env.restore(); loader.reset(); }
 });
 
+test("The global LRU evicts an older overview before a recently displayed zoom", () => {
+    const env = solidTileEnvironment(), { tiledRenderer: tiled, context: fit, view, create, layer, add } = env;
+    const canvas = create([0, 0, 255]), grid = new GridMap();
+    const overview = tiled.tiles_.values().next().value;
+    try {
+        tiled.draw(canvas, grid, view, fit, () => {}, { tiled: true });
+        const recentLayer = layer(1.1), recent = add(recentLayer, [255, 0, 0]);
+        const context = { ...fit, scaleXLog: Math.log(1.1), scaleYLog: Math.log(1.1) };
+        tiled.draw(canvas, grid, view, context, () => {}, { tiled: true });
+        env.advance(120); tiled.draw(canvas, grid, view, context, () => {}, { tiled: true });
+        const newestLayer = layer(2), newest = add(newestLayer, [0, 255, 0]);
+        const newestKey = `${newestLayer.key}|0,0`;
+        tiled.cacheLimits_.bytes = recent.bytes + newest.bytes;
+        tiled.trimCache(new Set([newestKey]), new Set([newestKey]));
+        assert.ok(!tiled.tiles_.has(`${overview.layer.key}|0,0`), "An old overview must not have a separate reservation");
+        assert.equal(overview.canvas.width, 1);
+        assert.equal(tiled.tiles_.get(`${recentLayer.key}|0,0`), recent);
+        assert.equal(tiled.tiles_.get(newestKey), newest);
+        assert.equal(tiled.tileBytes_, tiled.cacheLimits_.bytes);
+    } finally { env.restore(); }
+});
+
+test("A sufficient shared cache reuses several complete 4K zooms at different device pixel ratios", () => {
+    for (const ratio of [1, 1.5, 2]) {
+        const { loader, view } = load(wideGridCSV), env = tileEnvironment();
+        const { renderer, tiledRenderer: tiled, canvas } = env;
+        canvas.width = 3840; canvas.height = 2160;
+        canvas.clientWidth = 3840 / ratio; canvas.clientHeight = 2160 / ratio;
+        let context = renderer.fitScaleToData(view, { ...INITIAL_RENDERER_CONTEXT,
+            width: canvas.clientWidth, height: canvas.clientHeight });
+        tiled.tileBuilder_ = new CanvasRenderer(renderer.rectRenderer);
+        tiled.tileBuilder_.draw = () => Uint32Array.of(0);
+        const paint = () => tiled.draw(canvas, new GridMap(), view, context, () => window.requestAnimationFrame(paint), { tiled: true });
+        try {
+            const fit = context, span = Math.max(Math.log(4) - fit.scaleXLog, Math.log(4) - fit.scaleYLog);
+            const overviews = [];
+            for (const progress of [0, 0.375, 0.625, 0.875]) {
+                context = { ...fit, scaleXLog: fit.scaleXLog + span * progress,
+                    scaleYLog: fit.scaleYLog + span * progress };
+                // 各倍率の可視画像の合計が容量内に収まる条件を作る。
+                // 中間倍率と外周先読みは他のtestで確認する。
+                tiled.tileZoomKey_ = tiled.zoomKey(context.scaleXLog, context.scaleYLog);
+                paint(); tiled.tilePrefetchDisabled_ = true; paint(); env.drain();
+                const visible = tiled.tilePositions(tiled.tileRequest_).filter(job => job.visible).map(job => job.key);
+                assert.ok(visible.length > 64);
+                overviews.push(visible);
+                assert.ok(overviews.every(keys => keys.every(key => tiled.tiles_.has(key))));
+                assert.ok(tiled.tileBytes_ <= 256 * 1024 * 1024);
+            }
+            for (const progress of [0.375, 0, 0.875, 0.625, 0]) {
+                context = { ...fit, scaleXLog: fit.scaleXLog + span * progress,
+                    scaleYLog: fit.scaleYLog + span * progress };
+                paint();
+                assert.ok(tiled.tileJobs_.every(job => !job.visible), "Every cached zoom must reuse the whole saved screen");
+                assert.ok(tiled.layerCovers(tiled.tileRequest_, tiled.tileLayer_));
+            }
+            // 縮小したwindowでも、以前の大きい予算が残り続けないことを確認する。
+            canvas.width = canvas.clientWidth = 690; canvas.height = canvas.clientHeight = 340;
+            context = renderer.fitScaleToData(view, { ...fit, width: 690, height: 340 });
+            paint(); env.drain();
+            assert.ok(tiled.tileBytes_ <= 64 * 1024 * 1024);
+            if (tiled.previousPlot_) assert.ok(tiled.previousPlot_.canvas.width * tiled.previousPlot_.canvas.height * 4 <= 16 * 1024 * 1024);
+        } finally { env.restore(); loader.reset(); }
+    }
+});
+
+test("Empty 4K tiles share the global cache without occupying image slots", () => {
+    const { loader, view } = load(wideGridCSV), env = tileEnvironment();
+    const { renderer, tiledRenderer: tiled, canvas } = env;
+    canvas.width = canvas.clientWidth = 3840; canvas.height = canvas.clientHeight = 2160;
+    let context = renderer.fitScaleToData(view, { ...INITIAL_RENDERER_CONTEXT, width: 3840, height: 2160 });
+    tiled.tileBuilder_ = new CanvasRenderer(renderer.rectRenderer);
+    let selections = 0;
+    tiled.tileBuilder_.draw = () => { selections++; return new Uint32Array(0); };
+    const paint = () => tiled.draw(canvas, new GridMap(), view, context, () => window.requestAnimationFrame(paint), { tiled: true });
+    try {
+        const fit = context, span = Math.max(Math.log(4) - fit.scaleXLog, Math.log(4) - fit.scaleYLog);
+        for (const progress of [0, 0.375, 0.625, 0.875]) {
+            context = { ...fit, scaleXLog: fit.scaleXLog + span * progress, scaleYLog: fit.scaleYLog + span * progress };
+            paint(); env.drain();
+        }
+        assert.ok(tiled.tiles_.size > 256, "Empty results must not exhaust the old image count limit");
+        assert.ok(Array.from(tiled.tiles_.values()).every(tile => tile.canvas === null));
+        assert.equal(tiled.tileBytes_, tiled.tiles_.size * 128);
+        context = fit; paint(); env.drain();
+        const completed = selections; paint(); env.drain();
+        assert.equal(selections, completed, "A cached empty area must not rerun row selection");
+        for (let i = 1; i <= 4; i++) {
+            context = { ...fit, offsetX: i * 3840 }; paint(); env.drain();
+            assert.equal(tiled.emptyTileCount_, tiled.tiles_.size);
+            assert.ok(tiled.emptyTileCount_ <= tiled.cacheLimits_.emptyTiles);
+        }
+        tiled.draw(canvas, new GridMap(), view, context, () => {}, { tiled: false });
+        assert.equal(tiled.emptyTileCount_, 0);
+        assert.equal(tiled.tiles_.size, 0);
+    } finally { env.restore(); loader.reset(); }
+});
+
+test("An empty-result count overflow preserves existing image tiles", () => {
+    const { loader, view } = load(wideGridCSV), env = tileEnvironment();
+    const { renderer, tiledRenderer: tiled, canvas } = env;
+    canvas.width = canvas.clientWidth = 3840; canvas.height = canvas.clientHeight = 2160;
+    let context = renderer.fitScaleToData(view, { ...INITIAL_RENDERER_CONTEXT, width: 3840, height: 2160 });
+    tiled.tileBuilder_ = new CanvasRenderer(renderer.rectRenderer);
+    tiled.tileBuilder_.draw = () => Uint32Array.of(0);
+    const paint = () => tiled.draw(canvas, new GridMap(), view, context, () => window.requestAnimationFrame(paint), { tiled: true });
+    try {
+        paint(); env.drain();
+        const images = Array.from(tiled.tiles_.keys()), fit = context;
+        tiled.tileBuilder_.draw = () => new Uint32Array(0);
+        const span = Math.max(Math.log(4) - fit.scaleXLog, Math.log(4) - fit.scaleYLog);
+        for (let i = 0; i <= 4; i++) {
+            context = { ...fit, scaleXLog: fit.scaleXLog + span * 0.375,
+                scaleYLog: fit.scaleYLog + span * 0.375, offsetX: i * 3840 };
+            paint(); env.drain();
+            assert.ok(tiled.emptyTileCount_ <= tiled.cacheLimits_.emptyTiles);
+            assert.ok(images.every(key => tiled.tiles_.has(key)), "Dropping empty results must not evict images to satisfy a count limit");
+        }
+        assert.equal(tiled.emptyTileCount_, tiled.cacheLimits_.emptyTiles);
+    } finally { env.restore(); loader.reset(); }
+});
+
+test("Large viewports preserve the latest direct plot and release it on resize", () => {
+    const { loader, view } = load(wideGridCSV), env = tileEnvironment();
+    const { renderer, tiledRenderer: tiled, canvas } = env;
+    // 4Kから少し広いwindowも、従来の32MiB判定で直接描画へ固定されない。
+    canvas.width = 4096; canvas.height = 2160; canvas.clientWidth = 2048; canvas.clientHeight = 1080;
+    let context = renderer.fitScaleToData(view, { ...INITIAL_RENDERER_CONTEXT, width: 2048, height: 1080 });
+    tiled.tileBuilder_ = new CanvasRenderer(renderer.rectRenderer);
+    tiled.tileBuilder_.draw = () => new Uint32Array(0);
+    const paint = () => tiled.draw(canvas, new GridMap(), view, context, () => window.requestAnimationFrame(paint), { tiled: true });
+    try {
+        paint(); env.drain();
+        assert.ok(tiled.tileRequest_, "A viewport above 32 MiB must still use tiles");
+        Object.setPrototypeOf(renderer.rectRenderer, RectRendererWebGL.prototype);
+        context = { ...context, scaleXLog: Math.log(8), scaleYLog: Math.log(8) }; paint();
+        assert.equal(tiled.tileRequest_, null);
+        const previous = tiled.previousPlot_.canvas;
+        assert.equal(previous.width, 4096);
+        assert.equal(previous.height, 2160);
+        assert.equal(tiled.previousPlot_.context, context);
+        canvas.width = canvas.clientWidth = 690; canvas.height = canvas.clientHeight = 340;
+        context = { ...context, width: 690, height: 340 }; paint();
+        assert.equal(previous.width, 1, "The old large snapshot must be released when the viewport shrinks");
+        assert.equal(tiled.previousPlot_.canvas.width, 690);
+        tiled.clear();
+        assert.equal(tiled.previousPlot_, null);
+    } finally { env.restore(); loader.reset(); }
+});
+
+test("Sparse enlarged views draw directly while retaining the Fit cache for zoom-out", () => {
+    const { loader, view } = load(wideGridCSV), env = tileEnvironment(), { renderer, tiledRenderer: tiled, canvas } = env;
+    let context = renderer.fitScaleToData(view, { ...INITIAL_RENDERER_CONTEXT, width: 690, height: 340 });
+    const grid = new GridMap(), paint = () => tiled.draw(canvas, grid, view, context, () => window.requestAnimationFrame(paint), { tiled: true });
+    try {
+        paint(); env.drain();
+        const fit = context, overview = tiled.tilePositions(tiled.tileRequest_).filter(job => job.visible).map(job => job.key);
+        const tiles = tiled.tiles_.size, bytes = tiled.tileBytes_;
+        assert.ok(tiles > 0);
+        Object.setPrototypeOf(renderer.rectRenderer, RectRendererWebGL.prototype);
+        context = { ...fit, scaleXLog: Math.log(8), scaleYLog: Math.log(8) };
+        paint(); env.drain();
+        assert.equal(tiled.tileRequest_, null);
+        assert.equal(tiled.tileLayer_, null);
+        assert.equal(tiled.tileJobs_.length, 0);
+        assert.equal(env.frames.size + env.timers.size, 0);
+        assert.equal(tiled.tiles_.size, tiles);
+        assert.equal(tiled.tileBytes_, bytes);
+        assert.equal(tiled.previousPlot_.context, context);
+        assert.ok(grid.drawnIndex.some(row => row >= 0), "Direct rendering must keep native hover targets");
+        context = { ...context, offsetX: 0.37, offsetY: 0.53 }; paint();
+        assert.equal(tiled.tiles_.size, tiles);
+        assert.equal(tiled.previousPlot_.context, context, "Zoom-out must inherit the latest direct pan");
+        context = fit; paint();
+        assert.ok(overview.every(key => tiled.tiles_.has(key)));
+        assert.ok(tiled.tileJobs_.every(job => !job.visible));
+    } finally { env.restore(); loader.reset(); }
+});
+
+test("Large overlapping row counts retain tiled rendering even at a high zoom", () => {
+    const { loader, view } = load("cycle,unit\n" + "0,0\n".repeat(3000)), env = tileEnvironment();
+    const { renderer, tiledRenderer: tiled, canvas } = env;
+    Object.setPrototypeOf(renderer.rectRenderer, RectRendererWebGL.prototype);
+    const context = { ...INITIAL_RENDERER_CONTEXT, width: 690, height: 340, scaleXLog: Math.log(8), scaleYLog: Math.log(8) };
+    try {
+        tiled.draw(canvas, new GridMap(), view, context, () => {}, { tiled: true });
+        assert.ok(tiled.tileRequest_, "A large zoom does not prove that a dense overlapping dataset is cheap");
+        assert.ok(tiled.tileJobs_.some(job => job.visible));
+    } finally { env.restore(); loader.reset(); }
+});
+
+test("Sparse enlarged views use direct rendering even with a complete tile cache", () => {
+    const env = solidTileEnvironment(), { renderer, tiledRenderer: tiled, context, view, layer, add, create } = env;
+    const enlarged = layer(Math.exp(Math.log(8))), canvas = create([0, 0, 255]);
+    const zoom = { ...context, scaleXLog: Math.log(8), scaleYLog: Math.log(8) };
+    const cached = add(enlarged, [255, 0, 0]);
+    view.getVisibleRows = () => ({ order: null, start: 0, end: 1 });
+    let directDraws = 0;
+    renderer.draw = (target, _grid, _view, _context, _notify, options) => {
+        assert.equal(target, canvas);
+        assert.equal(options.aggregateSmallViews, true);
+        directDraws++; target.rgb = [255, 0, 0]; return Uint32Array.of(0);
+    };
+    try {
+        tiled.draw(canvas, new GridMap(), view, zoom, () => {}, { tiled: true });
+        assert.equal(directDraws, 1);
+        assert.equal(tiled.tileLayer_, null);
+        assert.equal(tiled.tileRequest_, null);
+        assert.equal(tiled.tileJobs_.length, 0, "Cheap views must not generate new tiles");
+        env.advance(120);
+        tiled.draw(canvas, new GridMap(), view, zoom, () => {}, { tiled: true });
+        assert.equal(directDraws, 2);
+        assert.deepEqual(canvas.rgb, [255, 0, 0]);
+        assert.equal(tiled.tiles_.get(`${enlarged.key}|0,0`), cached);
+        assert.equal(env.frames.size + env.timers.size, 0);
+    } finally { env.restore(); }
+});
+
+test("A large visible tile payload can evict older zooms without exceeding the shared budget", () => {
+    const { loader, view } = load(wideGridCSV), env = tileEnvironment(), { renderer, tiledRenderer: tiled, canvas } = env;
+    renderer.MARGIN_LEFT_ = renderer.MARGIN_BOTTOM_ = 0;
+    canvas.width = canvas.height = canvas.clientWidth = canvas.clientHeight = 256;
+    let context = renderer.fitScaleToData(view, { ...INITIAL_RENDERER_CONTEXT, width: 256, height: 256 });
+    tiled.tileBuilder_ = new CanvasRenderer(renderer.rectRenderer);
+    tiled.tileBuilder_.draw = () => Uint32Array.of(0);
+    const paint = () => tiled.draw(canvas, new GridMap(), view, context, () => window.requestAnimationFrame(paint), { tiled: true });
+    try {
+        paint(); env.drain();
+        const overview = Array.from(tiled.tiles_.keys());
+        tiled.tileBuilder_.draw = () => {
+            const rows = Uint32Array.of(0);
+            Object.defineProperty(rows, "byteLength", { value: 64 * 1024 * 1024 - 256 * 256 * 4 });
+            return rows;
+        };
+        context = { ...context, scaleXLog: context.scaleXLog + Math.log(4), scaleYLog: context.scaleYLog + Math.log(4) };
+        paint(); env.drain();
+        assert.equal(tiled.tileBypass_, null);
+        assert.ok(overview.every(key => !tiled.tiles_.has(key)), "The current view takes priority over older zooms");
+        assert.equal(tiled.tileBytes_, 64 * 1024 * 1024);
+        assert.ok(tiled.tilePositions(tiled.tileRequest_).filter(job => job.visible).every(job => tiled.tiles_.has(job.key)));
+    } finally { env.restore(); loader.reset(); }
+});
+
 test("Zoom reuses the latest complete pan with smoothing and keeps final tiles sharp", () => {
     const { loader, view } = load(gridCSV), env = tileEnvironment(), { tiledRenderer, canvas } = env;
     let context = { ...INITIAL_RENDERER_CONTEXT, width: 690, height: 340, scaleXLog: Math.log(10), scaleYLog: Math.log(10) };
@@ -1125,7 +1377,7 @@ test("A direct image after a large zoom jump stays above tiles from the old scal
 });
 
 test("Zoom tiles fade over the complete image and cancel the transition when disabled", () => {
-    const { loader, view } = load(gridCSV), env = tileEnvironment(), { renderer, tiledRenderer, canvas } = env;
+    const { loader, view } = load("cycle,unit\n" + "0,0\n".repeat(3000)), env = tileEnvironment(), { renderer, tiledRenderer, canvas } = env;
     const previousPerformance = global.performance;
     let now = 1000, context = { ...INITIAL_RENDERER_CONTEXT, width: 690, height: 340, scaleXLog: Math.log(10), scaleYLog: Math.log(10) };
     global.performance = { now: () => now };
@@ -1173,7 +1425,7 @@ function solidTileEnvironment() {
         const canvas = { width: 256, height: 256, clientWidth: 256, clientHeight: 256, rgb: [...rgb] };
         const stack = [], ctx = { canvas, globalAlpha: 1,
             save() { stack.push(this.globalAlpha); }, restore() { this.globalAlpha = stack.pop(); },
-            resetTransform() {}, setTransform() {},
+            resetTransform() {}, setTransform() {}, beginPath() {}, rect() {}, clip() {},
             fillRect() { const s = this.fillStyle.slice(1); this.blend([0, 2, 4].map(i => parseInt(s.slice(i, i + 2), 16))); },
             drawImage(image) { this.blend(image.rgb); },
             blend(rgb) { canvas.rgb = rgb.map((value, i) => value * this.globalAlpha + canvas.rgb[i] * (1 - this.globalAlpha)); }
@@ -1189,7 +1441,8 @@ function solidTileEnvironment() {
         env.tiledRenderer.tiles_.set(`${layer.key}|${x},0`, tile); env.tiledRenderer.tileBytes_ += tile.bytes;
         return tile;
     };
-    const view = { getX: () => 0, getY: () => 0 };
+    const view = { getX: () => 0, getY: () => 0,
+        getVisibleRows: () => ({ order: null, start: 0, end: 100000 }) };
     env.tiledRenderer.tileView_ = view; env.tiledRenderer.tileContentKey_ = "1,1,1,1";
     const blue = layer(1);
     env.tiledRenderer.tileFallback_ = blue;
@@ -1441,7 +1694,10 @@ test("Tile LRU bounds memory and invalidates data, point size and display scale 
             context = { ...context, offsetX: i % 8 * 1024, offsetY: Math.floor(i / 8) * 1024 };
             paint(); env.drain();
             assert.ok(tiledRenderer.tileBytes_ <= 64 * 1024 * 1024);
-            assert.ok(tiledRenderer.tiles_.size <= 256);
+            const empty = Array.from(tiledRenderer.tiles_.values()).filter(tile => tile.canvas === null).length;
+            assert.equal(tiledRenderer.emptyTileCount_, empty);
+            assert.ok(empty <= tiledRenderer.cacheLimits_.emptyTiles);
+            assert.ok(tiledRenderer.tiles_.size - empty <= 256, "The image budget still bounds nonempty tiles");
         }
         assert.ok(env.canvases.some(image => image.width === 1), "Evicted canvas backing stores must be released");
         for (const change of [
