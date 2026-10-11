@@ -15,6 +15,7 @@ const { Loader } = require("../src/loader.ts");
 const { inferViewDefinition } = require("../src/data_view.ts");
 const { CanvasRenderer, GridMap, INITIAL_RENDERER_CONTEXT } = require("../src/canvas_renderer.ts");
 const { TiledCanvasRenderer } = require("../src/tiled_canvas_renderer.ts");
+const { yieldToUI } = require("../src/axis_index.ts");
 const { RectRendererSoft, RectRendererWebGL, pixelEdge } = require("../src/rect_renderer.ts");
 const { Settings } = require("../src/settings.ts");
 // 設定のStore testではWorkerを起動しない。圧縮読み込みは実browserで確認する。
@@ -1674,14 +1675,21 @@ test("Disabling tiles cancels asynchronous preparation without publishing stale 
     tiledRenderer.tileBuilder_.exactOverview = () => null;
     let updates = 0;
     try {
+        // 初回の全体描画が非同期になると、その正常な完了通知まで中断対象として数えてしまう。
+        // 全体の行選択を先に完了させ、このtestではtileの非同期準備だけを中断する。
+        renderer.draw(canvas, new GridMap(), view, context);
         tiledRenderer.draw(canvas, new GridMap(), view, context, () => updates++, { tiled: true });
+        assert.equal(renderer.isPreparingRows, false);
         const [id, frame] = env.frames.entries().next().value;
         env.frames.delete(id); frame();
         assert.ok(tiledRenderer.tileBuilder_.pendingRows_, "Large tile preparation must yield");
         const image = tiledRenderer.tilePending_.canvas;
+        const beforeDisable = updates;
         tiledRenderer.draw(canvas, new GridMap(), view, context, undefined, { tiled: false });
-        await new Promise(resolve => setTimeout(resolve, 10));
-        assert.equal(updates, 0);
+        assert.equal(tiledRenderer.tileBuilder_.isPreparingRows, false, "Disabling tiles must cancel preparation immediately");
+        // 中断した準備の継続処理が走るまで待ち、固定msの待機で成功したように見せない。
+        await yieldToUI();
+        assert.equal(updates, beforeDisable, "Cancelled tile preparation must not request another redraw");
         assert.equal(tiledRenderer.tileBuilder_.pendingRows_, null);
         assert.equal(tiledRenderer.tiles_.size, 0);
         assert.equal(image.width, 1);
