@@ -883,7 +883,7 @@ test("Tiles reuse integer pans and previous zoom levels without rerunning row se
     } finally { env.restore(); loader.reset(); }
 });
 
-test("Tile updates cap visible and prefetched batches and defer prefetch during zoom", () => {
+test("Tile updates yield before prefetch and defer prefetch during zoom", () => {
     const { loader, view } = load(gridCSV), env = tileEnvironment(), { renderer, tiledRenderer: tiled, canvas } = env;
     const previousPerformance = global.performance;
     global.performance = { now: () => 1000 };
@@ -896,9 +896,8 @@ test("Tile updates cap visible and prefetched batches and defer prefetch during 
     const tick = () => {
         const [id, fn] = env.frames.entries().next().value;
         const visible = tiled.tileJobs_[0]?.visible, candidates = tiled.tileJobs_.filter(job => job.visible === visible).length;
-        const limit = tiled.tileSettled_ ? (visible ? 8 : 4) : 2;
         env.frames.delete(id); const before = draws; fn();
-        assert.equal(draws - before, Math.min(limit, candidates), "A frame must cap tiles and yield before switching to prefetch");
+        assert.equal(draws - before, candidates, "Cheap tiles must finish before yielding to a different batch");
     };
     try {
         paint();
@@ -930,9 +929,9 @@ test("Tile generation yields on time budgets before starting another image", () 
     const { loader, view } = load(gridCSV), previousPerformance = global.performance;
     try {
         for (const [settled, visible, cost, expected] of [
-            [false, true, 0, 2], [false, true, 2, 1],
-            [true, true, 3, 2], [true, true, 7, 1],
-            [true, false, 0, 4], [true, false, 1.5, 2], [true, false, 4, 1]
+            [false, true, 0, null], [false, true, 1, 12], [false, true, 2, 6], [false, true, 3, 4], [false, true, 7, 2], [false, true, 13, 1],
+            [true, true, 0, null], [true, true, 1, 12], [true, true, 3, 4], [true, true, 7, 2], [true, true, 13, 1],
+            [true, false, 0, null], [true, false, 0.5, 12], [true, false, 1.5, 4], [true, false, 4, 2], [true, false, 7, 1]
         ]) {
             const env = tileEnvironment(), { renderer, tiledRenderer: tiled, canvas } = env;
             let now = 1000, draws = 0;
@@ -944,10 +943,11 @@ test("Tile generation yields on time budgets before starting another image", () 
                 tiled.draw(canvas, new GridMap(), view, { ...INITIAL_RENDERER_CONTEXT, width: 1280, height: 768 }, () => {}, { tiled: true });
                 tiled.tileSettled_ = settled;
                 tiled.tileJobs_ = tiled.tileJobs_.filter(job => job.visible === visible);
+                const candidates = tiled.tileJobs_.length;
                 const [id, fn] = env.frames.entries().next().value; env.frames.delete(id); fn();
-                assert.equal(draws, expected, `Unexpected image count for settled=${settled}, visible=${visible}, cost=${cost}`);
-                assert.ok(tiled.tileJobs_.length, "Remaining work must resume on a later frame");
-                assert.equal(env.frames.size, 1);
+                assert.equal(draws, expected ?? candidates, `Unexpected image count for settled=${settled}, visible=${visible}, cost=${cost}`);
+                assert.equal(tiled.tileJobs_.length, candidates - draws);
+                assert.equal(env.frames.size, tiled.tileJobs_.length ? 1 : 0, "Only remaining work may schedule another frame");
             } finally { env.restore(); }
         }
     } finally { global.performance = previousPerformance; loader.reset(); }
@@ -955,6 +955,7 @@ test("Tile generation yields on time budgets before starting another image", () 
 
 test("Rapid zooms keep the last complete layer instead of an incomplete intermediate layer", () => {
     const { loader, view } = load(gridCSV), env = tileEnvironment(), { tiledRenderer, canvas } = env;
+    const previousPerformance = global.performance;
     canvas.width = canvas.clientWidth = 1280; canvas.height = canvas.clientHeight = 768;
     let context = { ...INITIAL_RENDERER_CONTEXT, width: 1280, height: 768, scaleXLog: Math.log(10), scaleYLog: Math.log(10) };
     const paint = () => tiledRenderer.draw(canvas, new GridMap(), view, context, () => {}, { tiled: true });
@@ -967,6 +968,11 @@ test("Rapid zooms keep the last complete layer instead of an incomplete intermed
         const [timerId, timer] = env.timers.entries().next().value;
         env.timers.delete(timerId); timer();
         paint();
+        // 軽いtileは1frameで完成するため、時間予算を使い切る重いtileを再現する。
+        let now = previousPerformance.now();
+        global.performance = { now: () => now };
+        const draw = tiledRenderer.tileBuilder_.draw.bind(tiledRenderer.tileBuilder_);
+        tiledRenderer.tileBuilder_.draw = (...args) => { const rows = draw(...args); now += 12; return rows; };
         const [frameId, frame] = env.frames.entries().next().value;
         env.frames.delete(frameId); frame();
         const intermediate = tiledRenderer.tileLayer_;
@@ -975,7 +981,7 @@ test("Rapid zooms keep the last complete layer instead of an incomplete intermed
         context = { ...context, scaleXLog: Math.log(12), scaleYLog: Math.log(12) };
         paint();
         assert.equal(tiledRenderer.tileFallback_, completeLayer, "An incomplete scale must not replace a complete fallback");
-    } finally { env.restore(); loader.reset(); }
+    } finally { env.restore(); loader.reset(); global.performance = previousPerformance; }
 });
 
 test("Prefetched tiles cover a centered half-scale zoom and an edge wheel step at fractional DPR", () => {

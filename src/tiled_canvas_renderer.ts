@@ -501,23 +501,22 @@ class TiledCanvasRenderer {
         const start = performance.now(), generation = this.tileGeneration_, size = TiledCanvasRenderer.TILE_SIZE;
         const builder = this.tileBuilder_ ??= new CanvasRenderer(this.renderer_.rectRenderer);
         builder.MARGIN_LEFT_ = builder.MARGIN_BOTTOM_ = 0;
-        // 軽いtileは同じframeで進め、操作中は入力・合成へ時間を残す。
-        // 停止後は予算を広げて仕上げる。1枚の描画・転送は途中で止められないため、
-        // 時間は終了後に判定する目安とし、空tile等にも枚数の上限を設ける。
+        // 可視tileはzoom中も停止後と同じ予算で進め、完成画像の待ちを短くする。
+        // 先読みは小さい予算で行う。1枚の描画・転送は途中で止められないため、
+        // 時間は1枚ごとの終了後に判定する目安とし、軽いtileは予算内でまとめて進める。
         const visibleBatch = this.tileJobs_[0]?.visible;
-        const budget = this.tileSettled_ ? (visibleBatch ? 6 : 3) : 2;
-        const limit = this.tileSettled_ ? (visibleBatch ? 8 : 4) : 2;
+        const budget = visibleBatch ? 12 : 6;
         // 同じbatch内では表示範囲が変わらない。範囲検索と集合の生成は1回で済ませる。
         const positions = this.tilePositions(request);
         const visibleKeys = new Set(positions.filter(position => position.visible).map(position => position.key));
         const wantedKeys = new Set(positions.map(position => position.key));
         let visibleBytes = 0;
         for (const [key, cached] of this.tiles_) if (visibleKeys.has(key)) visibleBytes += cached.bytes;
-        let count = 0, changed = false;
-        while (count < limit && this.tileJobs_.length) {
+        let changed = false;
+        while (this.tileJobs_.length) {
             const job = this.tilePending_?.job ?? this.tileJobs_[0];
             // 可視tileの完了後は一度表示へ譲り、先読みを同じframeに積み増さない。
-            if (count && job.visible !== visibleBatch) break;
+            if (job.visible !== visibleBatch) break;
             if (!this.tilePending_) {
                 const canvas = document.createElement("canvas"); canvas.width = canvas.height = size;
                 canvas.getContext("2d")!.setTransform(request.ratio.x, 0, 0, request.ratio.y, 0, 0);
@@ -556,7 +555,7 @@ class TiledCanvasRenderer {
             this.tilePending_ = null; builder.releasePreparedRows();
             this.tileJobs_ = this.tileJobs_.filter(next => next.key !== job.key);
             this.trimCache(visibleKeys, wantedKeys, !job.visible);
-            changed ||= visibleKeys.has(job.key); count++;
+            changed ||= visibleKeys.has(job.key);
             if (performance.now() - start >= budget) break;
         }
         if (changed || this.tileFading_) request.requestDraw();
