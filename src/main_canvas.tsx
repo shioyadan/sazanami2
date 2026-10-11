@@ -582,6 +582,10 @@ const MainCanvas: React.FC<{ store: Store }> = ({ store }) => {
         store.on(CHANGE.FILE_FORMAT_DETECTED, onFileFormatDetected);
         store.on(CHANGE.CONTENT_UPDATED, onContentUpdated);
         const onFit = () => {
+            // 旧軸で始まった操作の残りが、新しい軸のFitを上書きしないよう中断する。
+            cancelZoomAnimation();
+            cancelPanAnimation();
+            panRef.current.remainingDx = panRef.current.remainingDy = 0;
             const dataView = store.loader.GetDataView(store.state.viewDef);
             const next = renderer.fitScaleToData(dataView, store.state.renderCtx, 1.0);
             store.trigger(ACTION.UPDATE_RENDERER_CONTEXT, next);

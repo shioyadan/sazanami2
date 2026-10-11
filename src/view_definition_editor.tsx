@@ -430,18 +430,10 @@ const strictApply = (store: Store, testDef: ViewDefinition): { ok: boolean; erro
 
         // 一度生成して，不正な定義が渡った場合は例外で落ちる
         createDataView(store.loader, def);
-        const viewDef = store.state.viewDef;
-
-        let oldX = viewDef.view.axisXField;
-        let oldY = viewDef.view.axisYField;
 
         // ここまで到達したら安全：即時反映
         store.trigger(ACTION.VIEW_DEF_APPLY, def);
         store.trigger(ACTION.SHOW_MESSAGE_IN_STATUS_BAR, "View updated");
-
-        // X 軸か Y 軸が変化した場合のみ FIT しなおす
-        if (oldX !== viewDef.view.axisXField || oldY !== viewDef.view.axisYField)
-            store.trigger(ACTION.CANVAS_FIT);
 
         return { ok: true, errors: [] };
     } catch (e: any) {

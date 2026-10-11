@@ -151,7 +151,8 @@ class Store {
                     else {
                         def = inferViewDefinition(this.loader);
                     }
-                    applyDefinition(def);
+                    // 初回のFitはFILE_FORMAT_DETECTED側で行い、重複させない。
+                    applyDefinition(def, false);
                     this.trigger(CHANGE.FILE_FORMAT_DETECTED);
                 },
                 (percent, _lineNum) => {
@@ -237,7 +238,8 @@ class Store {
         }
 
         // Apply: バリデーションのうえでコミット＆適用
-        const applyDefinition = (def: ViewDefinition) => {
+        const applyDefinition = (def: ViewDefinition, fitAxes = true) => {
+            const previous = this.state_.viewDef.view;
             const ok = validateAndTryInit_(def);
             this.patchState({ viewDef: def });
             if (!ok) {
@@ -245,6 +247,11 @@ class Store {
                 return;
             }
             this.trigger(CHANGE.VIEW_DEF_CHANGED, def);
+            // 軸の座標系が変わると以前の倍率・位置は使えない。色だけの変更では維持する。
+            // 更新済みの定義を使って、UIの適用経路によらず一度だけFitする。
+            if (fitAxes && (previous.axisXField !== def.view.axisXField || previous.axisYField !== def.view.axisYField)) {
+                this.trigger(ACTION.CANVAS_FIT);
+            }
         }
 
         this.on(ACTION.VIEW_DEF_APPLY, (def: ViewDefinition) => {

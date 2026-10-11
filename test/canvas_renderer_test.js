@@ -1458,6 +1458,58 @@ test("Tile LRU bounds memory and invalidates data, point size and display scale 
     } finally { env.restore(); loader.reset(); }
 });
 
+test("Axis edits fit the new ranges once while color edits retain the viewport", () => {
+    const previous = global.localStorage;
+    global.localStorage = { getItem() { return null; }, setItem() {} };
+    const store = new Store(), { renderer } = makeRenderer();
+    let fits = 0;
+    const fit = () => {
+        fits++;
+        const view = store.loader.GetDataView(store.state.viewDef);
+        store.trigger(ACTION.UPDATE_RENDERER_CONTEXT, renderer.fitScaleToData(view, store.state.renderCtx));
+    };
+    store.on(CHANGE.FILE_FORMAT_DETECTED, fit);
+    store.on(CHANGE.CANVAS_FIT, fit);
+    try {
+        store.trigger(ACTION.UPDATE_RENDERER_CONTEXT, { ...INITIAL_RENDERER_CONTEXT, width: 690, height: 340 });
+        store.trigger(ACTION.FILE_LOAD_FROM_FILE_LINE_READER, {
+            load(onLine, onFinish) { sample.trimEnd().split("\n").forEach(onLine); onFinish(); },
+            getProgress() { return 1; }, cancel() {}
+        });
+        assert.equal(fits, 1, "Initial file detection must fit only once");
+
+        // 両軸の入替、Xだけの変更、Yだけの変更で、それぞれ新しい範囲へ戻す。
+        for (const [axisXField, axisYField] of [["cycle", "unit"], ["unit", "unit"], ["unit", "cycle"]]) {
+            const previousFits = fits;
+            store.trigger(ACTION.UPDATE_RENDERER_CONTEXT, { ...store.state.renderCtx,
+                scaleXLog: 3, scaleYLog: -3, offsetX: 12345, offsetY: -98765 });
+            const definition = { ...store.state.viewDef, view: { ...store.state.viewDef.view, axisXField, axisYField } };
+            store.trigger(ACTION.VIEW_DEF_APPLY, definition);
+            assert.equal(fits, previousFits + 1);
+            const view = store.loader.GetDataView(definition);
+            assert.deepEqual(store.state.renderCtx, renderer.fitScaleToData(view, store.state.renderCtx));
+        }
+
+        const panned = { ...store.state.renderCtx, offsetX: 27.25, offsetY: 91.75 }, previousFits = fits;
+        store.trigger(ACTION.UPDATE_RENDERER_CONTEXT, panned);
+        for (const definition of [store.state.viewDef,
+            { ...store.state.viewDef, view: { ...store.state.viewDef.view, colorField: "unit" } },
+            { ...store.state.viewDef, view: { ...store.state.viewDef.view, colorMap: "viridis" } },
+            { ...store.state.viewDef, columns: { unused: "cycle * 2" } }]) {
+            store.trigger(ACTION.VIEW_DEF_APPLY, definition);
+            assert.equal(fits, previousFits);
+            assert.equal(store.state.renderCtx, panned);
+        }
+
+        store.trigger(ACTION.VIEW_DEF_APPLY, { ...store.state.viewDef,
+            view: { ...store.state.viewDef.view, axisXField: "cycle", axisYField: "unit" } });
+        store.trigger(ACTION.VIEW_DEF_INFER_REQUEST);
+        assert.equal(fits, previousFits + 2, "Resetting inferred axes must also fit");
+        assert.deepEqual(store.state.renderCtx,
+            renderer.fitScaleToData(store.loader.GetDataView(store.state.viewDef), store.state.renderCtx));
+    } finally { store.loader.reset(); global.localStorage = previous; }
+});
+
 test("Tiled rendering defaults on and restores only valid persisted booleans", () => {
     const previous = global.localStorage;
     try {
